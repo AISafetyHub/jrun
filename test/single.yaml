@@ -1,0 +1,13 @@
+description: Single job test - simple echo task
+
+job:
+  name: test_single_echo
+  command: echo "Hello from jrun single job test"
+  resource_config:
+    queue_name: baai-safety_research_safety-research
+    priority: high
+    accelerator_model: J1_ADV_H1-SXM4-80GB
+    accelerator_count: 1
+    cpu_cores: 8
+    mem_gib: 128
+    shared_mem_gib: 64

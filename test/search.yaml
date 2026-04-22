@@ -1,0 +1,24 @@
+description: Grid search test - evaluate models on multiple datasets
+
+search:
+  job_template:
+    name: test_eval_{model}_{data}_{auto:4s}
+    command: echo "Evaluating model={model} on dataset={data}"
+    resource_config:
+      queue_name: baai-safety_research_safety-research
+      priority: high
+      accelerator_model: J1_ADV_H1-SXM4-80GB
+      accelerator_count: 1
+      cpu_cores: 8
+      mem_gib: 128
+      shared_mem_gib: 64
+
+  sampling: grid
+  max_trials: 20
+  parallel_trials: 4
+
+  params:
+    - name: model
+      values: ["llama3_8b", "gpt35"]
+    - name: data
+      values: ["news", "paper", "poem"]
