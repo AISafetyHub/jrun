@@ -1,0 +1,27 @@
+description: Multi-node job test - 1 master + 2 workers with env vars
+
+job:
+  name: test_multinode
+  commands:
+    - cd /workspace
+    - torchrun --nproc_per_node=1 --nnodes=3 train.py
+  envs:
+    {
+      HOME: /home/yijingwei,
+      NCCL_DEBUG: INFO,
+      MASTER_PORT: "29500",
+    }
+  resource_config:
+    queue_name: baai-safety_research_safety-research
+    priority: high
+    accelerator_model: J1_ADV_H1-SXM4-80GB
+    accelerator_count: 1
+    cpu_cores: 8
+    mem_gib: 32
+    shared_mem_gib: 16
+    worker:
+      replicas: 2
+      accelerator_count: 2
+      cpu_cores: 16
+      mem_gib: 64
+      shared_mem_gib: 32

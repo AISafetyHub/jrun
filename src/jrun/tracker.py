@@ -29,10 +29,19 @@ def record_search(jrun_dir: Path, search_name: str, config_file: str, job_entrie
     tracker = load_tracker(jrun_dir)
     now = datetime.now().isoformat(timespec="seconds")
 
+    existing_search = tracker["searches"].get(search_name)
+    old_job_ids = existing_search["job_ids"] if existing_search else []
+    new_job_ids = [j["job_id"] for j in job_entries]
+    # Keep old jobs that weren't replaced (skipped ones), then append new ones
+    new_names = {j["name"] for j in job_entries}
+    kept_ids = [
+        jid for jid in old_job_ids
+        if jid in tracker.get("jobs", {}) and tracker["jobs"][jid].get("name") not in new_names
+    ]
     tracker["searches"][search_name] = {
         "config_file": config_file,
         "submitted_at": now,
-        "job_ids": [j["job_id"] for j in job_entries],
+        "job_ids": kept_ids + new_job_ids,
     }
     for j in job_entries:
         tracker["jobs"][j["job_id"]] = {
@@ -85,6 +94,19 @@ def remove_job(jrun_dir: Path, job_id: str):
         if job_id in search.get("job_ids", []):
             search["job_ids"].remove(job_id)
     save_tracker(jrun_dir, tracker)
+
+
+def remove_search(jrun_dir: Path, search_name: str) -> list[str]:
+    """Remove a search and all its jobs. Returns the list of job IDs removed."""
+    tracker = load_tracker(jrun_dir)
+    search = tracker.get("searches", {}).pop(search_name, None)
+    if not search:
+        return []
+    job_ids = search.get("job_ids", [])
+    for jid in job_ids:
+        tracker["jobs"].pop(jid, None)
+    save_tracker(jrun_dir, tracker)
+    return job_ids
 
 
 def update_job_status(jrun_dir: Path, job_id: str, status: str):

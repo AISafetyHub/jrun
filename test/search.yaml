@@ -1,14 +1,21 @@
 description: Grid search test - evaluate models on multiple datasets
 
 search:
+  name: test_eval
   job_template:
     name: test_eval_{model}_{data}_{auto:4s}
-    command: echo "Evaluating model={model} on dataset={data}"
+    commands:
+      - echo "Evaluating model={model} on dataset={data}"
+    envs:
+      {
+        HOME: /home/yijingwei,
+        MODEL_NAME: "{model}",
+      }
     resource_config:
       queue_name: baai-safety_research_safety-research
       priority: high
       accelerator_model: J1_ADV_H1-SXM4-80GB
-      accelerator_count: 1
+      accelerator_count: 0
       cpu_cores: 8
       mem_gib: 128
       shared_mem_gib: 64

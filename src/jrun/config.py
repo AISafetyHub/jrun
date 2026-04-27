@@ -76,13 +76,25 @@ def expand_grid(config: dict) -> list[dict]:
             name = name.replace(f"{{{k}}}", str(v))
         name = _resolve_auto(name, mapping)
 
-        command = _resolve_command(template.get("command", ""), mapping)
+        command = _resolve_command(template.get("commands", template.get("command", "")), mapping)
+
+        envs = template.get("envs", {})
+        if envs:
+            resolved_envs = {}
+            for ek, ev in envs.items():
+                val = str(ev)
+                for k, v in mapping.items():
+                    val = val.replace(f"{{{k}}}", str(v))
+                val = val.replace("$$", "$")
+                resolved_envs[ek] = val
+            envs = resolved_envs
 
         jobs.append({
             "name": name,
             "command": command,
             "params": mapping,
             "resource_config": template.get("resource_config", {}),
+            "envs": envs,
         })
 
     return jobs
@@ -93,7 +105,7 @@ def build_single_job(config: dict) -> dict | None:
     job = config.get("job")
     if not job:
         return None
-    cmd_raw = job.get("command", "")
+    cmd_raw = job.get("commands", job.get("command", ""))
     if isinstance(cmd_raw, list):
         command = " && ".join(str(c) for c in cmd_raw)
     else:
@@ -103,16 +115,18 @@ def build_single_job(config: dict) -> dict | None:
         "command": command,
         "params": {},
         "resource_config": job.get("resource_config", {}),
+        "envs": job.get("envs", {}),
     }
 
 
 def get_search_name(config: dict) -> str | None:
-    """Extract search name from template (strip param placeholders)."""
+    """Get search name from explicit field, or derive from job template name."""
     search = config.get("search")
     if not search:
         return None
+    if "name" in search:
+        return search["name"]
     name_tmpl = search["job_template"]["name"]
-    # Remove {param} and {auto:Xs} placeholders, then strip trailing underscores
     clean = re.sub(r"\{[^}]+\}", "", name_tmpl)
     clean = re.sub(r"_+", "_", clean).strip("_")
     return clean

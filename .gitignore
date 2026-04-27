@@ -1,5 +1,6 @@
 .jrun/
 .venv/
+.claude/
 
 # Python-generated files
 __pycache__/
