@@ -6,7 +6,7 @@ job:
   resource_config:
     queue_name: local
     priority: high
-    accelerator_model: J1_ADV_H1-SXM4-80GB
+    accelerator_model: NVIDIA-A100-SXM4-40GB
     accelerator_count: 1
     cpu_cores: 8
     mem_gib: 128

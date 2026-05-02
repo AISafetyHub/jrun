@@ -548,7 +548,7 @@ def _remove_one_job(job_id: str, config_name: str | None, exp_id: str | None):
     """Remove config from experiment and cancel job on platform."""
     if exp_id and config_name:
         _remove_config_from_experiment(exp_id, config_name)
-    airsctl.job_cancel(job_id)
+    _log_airsctl_error(airsctl.job_cancel(job_id), "job cancel")
 
 
 def _remove_config_from_experiment(exp_id: str, config_name: str):
@@ -573,7 +573,7 @@ def _remove_config_from_experiment(exp_id: str, config_name: str):
         json.dump(config_data, f, indent=2)
         tmp_path = f.name
     try:
-        airsctl.experiment_modify(tmp_path)
+        _log_airsctl_error(airsctl.experiment_modify(tmp_path), "experiment modify")
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
