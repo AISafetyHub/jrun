@@ -7,14 +7,17 @@ from pathlib import Path
 import click
 
 from jrun.settings import find_jrun_dir, load_settings, save_settings, extract_platform_ids, build_job_url
-from jrun.config import load_config, expand_grid, build_single_job, get_search_name
+from jrun.config import load_config, expand_grid, build_single_job, get_search_name, get_scheduler_params
 from jrun.tracker import (
     record_search, record_single_job, get_jobs_by_search,
     get_all_jobs, update_job_status, load_tracker,
     find_job_by_name, remove_job, remove_search,
+    record_pending_jobs, replace_pending_with_real,
 )
+from jrun.submit import submit_one_job
 from jrun import airsctl
 from jrun.template import TEMPLATE_CONTENT
+from jrun.scheduler import start_scheduler, stop_scheduler, is_scheduler_running
 
 
 @click.group()
@@ -75,6 +78,15 @@ def init(experiment_name, experiment_id):
     click.echo(f"Initialized jrun: {jrun_dir}")
 
 
+def _log_airsctl_error(result, action: str):
+    if result.returncode != 0:
+        click.echo(f"  Warning: {action} failed (rc={result.returncode})", err=True)
+        if result.stdout:
+            click.echo(result.stdout.strip(), err=True)
+        if result.stderr:
+            click.echo(result.stderr.strip(), err=True)
+
+
 def _is_local_job(job: dict) -> bool:
     return job.get("resource_config", {}).get("queue_name") == "local"
 
@@ -123,8 +135,6 @@ def submit(config_file, dry_run, overwrite, status):
             click.echo(f"Local debug: running first job only")
             _run_local(jobs[0])
             return
-
-        job_entries = []
 
         # Phase 1: scan and classify
         new_jobs = []
@@ -179,15 +189,24 @@ def submit(config_file, dry_run, overwrite, status):
             click.echo("Cleaning up old jobs...")
             for j, old_id, old_status in overwrite_jobs:
                 if old_status in ("Submitted", "Running", "Queued", "Starting", "Scheduling"):
-                    airsctl.job_stop(old_id)
+                    _log_airsctl_error(airsctl.job_stop(old_id), "job stop")
                 settings_tmp, _ = load_settings()
                 _remove_one_job(old_id, j["name"], settings_tmp.get("experiment_id"))
                 remove_job(jrun_dir, old_id)
 
-        # Phase 4: submit with progress bar
+        # Phase 4: submit
         submit_list = new_jobs + [j for j, _, _ in overwrite_jobs]
-        with click.progressbar(submit_list, label="Submitting", item_show_func=lambda j: j["name"] if j else "") as bar:
-            for j in bar:
+        sched_params = get_scheduler_params(config)
+        parallel = sched_params["parallel_trials"]
+
+        if parallel and parallel < len(submit_list):
+            # Parallel mode: submit first batch, schedule the rest
+            immediate = submit_list[:parallel]
+            pending = submit_list[parallel:]
+
+            job_entries = []
+            click.echo(f"Submitting first {len(immediate)} jobs (parallel_trials={parallel})...")
+            for j in immediate:
                 job_id = _submit_one_job(j, exp_name, exp_id, quiet=True)
                 if job_id:
                     job_entries.append({
@@ -195,8 +214,31 @@ def submit(config_file, dry_run, overwrite, status):
                         "name": j["name"],
                         "params": j["params"],
                     })
-        record_search(jrun_dir, search_name, config_file, job_entries)
-        click.echo(f"\nSubmitted {len(job_entries)} jobs under search '{search_name}'")
+
+            record_search(jrun_dir, search_name, config_file, job_entries)
+            pending_ids = record_pending_jobs(jrun_dir, search_name, config_file, pending)
+
+            pid = start_scheduler(
+                jrun_dir, search_name, exp_name, exp_id,
+                parallel, sched_params["poll_interval"], pending,
+            )
+            click.echo(f"Submitted {len(job_entries)} jobs, {len(pending)} pending")
+            click.echo(f"Scheduler daemon started (pid={pid}, poll={sched_params['poll_interval']}s)")
+            click.echo(f"  Log: {jrun_dir / 'scheduler' / f'{search_name}.log'}")
+        else:
+            # Original behavior: submit all at once
+            job_entries = []
+            with click.progressbar(submit_list, label="Submitting", item_show_func=lambda j: j["name"] if j else "") as bar:
+                for j in bar:
+                    job_id = _submit_one_job(j, exp_name, exp_id, quiet=True)
+                    if job_id:
+                        job_entries.append({
+                            "job_id": job_id,
+                            "name": j["name"],
+                            "params": j["params"],
+                        })
+            record_search(jrun_dir, search_name, config_file, job_entries)
+            click.echo(f"\nSubmitted {len(job_entries)} jobs under search '{search_name}'")
 
     else:
         job = build_single_job(config)
@@ -242,7 +284,7 @@ def submit(config_file, dry_run, overwrite, status):
                     click.echo("Skipped.")
                     return
             if old_status in ("Submitted", "Running", "Queued", "Starting", "Scheduling"):
-                airsctl.job_stop(old_id)
+                _log_airsctl_error(airsctl.job_stop(old_id), "job stop")
             _remove_one_job(old_id, job["name"], settings.get("experiment_id"))
             remove_job(jrun_dir, old_id)
 
@@ -254,115 +296,12 @@ def submit(config_file, dry_run, overwrite, status):
 
 
 
+def _click_log_fn(msg, err=False):
+    click.echo(msg, err=err)
+
+
 def _submit_one_job(job: dict, exp_name: str | None, exp_id: str | None, quiet: bool = False) -> str | None:
-    """Write a temp config JSON, modify experiment, then run job. Returns job_id or None."""
-    if not exp_id:
-        click.echo("  Error: experiment_id is required for submission. Run 'jrun init -e <id>' first.", err=True)
-        return None
-
-    # Fetch current experiment config
-    output = airsctl.experiment_list(exp_id=exp_id)
-    if not output:
-        click.echo("  Error: could not fetch experiment config", err=True)
-        return None
-
-    try:
-        config_data = json.loads(output)
-    except json.JSONDecodeError:
-        click.echo("  Error: invalid experiment config JSON", err=True)
-        return None
-
-    # Build new config entry by cloning an existing one as template
-    advance_configs = config_data.get("advance_config_infos", [])
-    if not advance_configs:
-        click.echo("  Error: experiment has no existing config to use as template", err=True)
-        return None
-
-    # Use the first existing config as template
-    new_config = json.loads(json.dumps(advance_configs[0]))
-    new_config["config_name"] = job["name"]
-    new_config["command"] = job["command"]
-    # Remove conf_id so platform creates a new one
-    new_config.pop("conf_id", None)
-
-    # Override resource_config if specified in yaml
-    rc = job.get("resource_config", {})
-    if rc and new_config.get("resource_config_list"):
-        res = new_config["resource_config_list"][0]
-        if rc.get("priority"):
-            res["priority"] = rc["priority"]
-        role_list = res.get("role_info_list", [])
-        master = role_list[0] if role_list else {}
-        detail = master.get("resource_request_detail", {})
-        for key in ("accelerator_model", "accelerator_count", "cpu_cores", "mem_gib", "shared_mem_gib"):
-            if key in rc:
-                detail[key] = rc[key]
-
-        # Multi-node worker support
-        worker_cfg = rc.get("worker")
-        if worker_cfg:
-            worker_replicas = worker_cfg.get("replicas", 1)
-            worker_detail = dict(detail)
-            for key in ("accelerator_model", "accelerator_count", "cpu_cores", "mem_gib", "shared_mem_gib"):
-                if key in worker_cfg:
-                    worker_detail[key] = worker_cfg[key]
-            worker_role = {
-                "name": "Worker",
-                "replicas": worker_replicas,
-                "resource_request_detail": worker_detail,
-            }
-            if "resource_region" in master:
-                worker_role["resource_region"] = master["resource_region"]
-            role_list = [r for r in role_list if r.get("name") != "Worker"]
-            role_list.append(worker_role)
-            res["role_info_list"] = role_list
-        else:
-            role_list = [r for r in role_list if r.get("name") != "Worker"]
-            res["role_info_list"] = role_list
-
-    # Set environment variables (hyper_parameter)
-    envs = job.get("envs", {})
-    if envs:
-        new_config["hyper_parameter"] = {str(k): str(v) for k, v in envs.items()}
-    else:
-        new_config.pop("hyper_parameter", None)
-
-    # Append or replace config with same name
-    advance_configs = [c for c in advance_configs if c.get("config_name") != job["name"]]
-    advance_configs.append(new_config)
-    config_data["advance_config_infos"] = advance_configs
-
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", prefix="jrun_", delete=False
-    ) as f:
-        json.dump(config_data, f, indent=2)
-        tmp_path = f.name
-
-    try:
-        result = airsctl.experiment_modify(tmp_path)
-        if result.returncode != 0:
-            click.echo(f"  Warning: experiment modify failed (rc={result.returncode})", err=True)
-            click.echo(result.stderr, err=True)
-            return None
-
-        result = airsctl.job_run(
-            exp_name=exp_name, exp_id=exp_id, config_name=job["name"]
-        )
-        if result.returncode != 0:
-            click.echo(f"  Warning: job run failed (rc={result.returncode})", err=True)
-            click.echo(result.stderr, err=True)
-            return None
-
-        # Parse job_id from output: "Job <uuid> submitted"
-        output = result.stdout
-        match = re.search(r"Job ([0-9a-f-]{36}) submitted", output)
-        if match:
-            return match.group(1)
-        else:
-            click.echo(f"  Warning: could not parse job ID from output", err=True)
-            return job["name"]
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
+    return submit_one_job(job, exp_name, exp_id, log_fn=_click_log_fn)
 
 
 @cli.command()
@@ -395,6 +334,8 @@ def _show_all_jobs(tracker: dict, status_filter: set | None = None):
         return
 
     for jid, info in jobs.items():
+        if info.get("status") == "Pending":
+            continue
         output = airsctl.job_list(jid)
         if output:
             s = _parse_job_status(output)
@@ -407,6 +348,12 @@ def _show_all_jobs(tracker: dict, status_filter: set | None = None):
 
     _print_job_table(jobs, settings)
 
+    # Show scheduler info for active searches
+    for sname in tracker.get("searches", {}):
+        pid = is_scheduler_running(jrun_dir, sname)
+        if pid:
+            click.echo(f"\nScheduler active for '{sname}' (pid={pid})")
+
 
 def _show_search_jobs(tracker: dict, search_name: str, jrun_dir: Path, status_filter: set | None = None):
     settings, _ = load_settings()
@@ -414,17 +361,22 @@ def _show_search_jobs(tracker: dict, search_name: str, jrun_dir: Path, status_fi
     click.echo(f"Search: {search_name}")
     click.echo(f"Config: {search['config_file']}")
     click.echo(f"Submitted: {search['submitted_at']}")
+
+    pid = is_scheduler_running(jrun_dir, search_name)
+    if pid:
+        click.echo(f"Scheduler: active (pid={pid})")
     click.echo()
 
     jobs = {}
     for jid in search["job_ids"]:
         if jid in tracker["jobs"]:
-            output = airsctl.job_list(jid)
-            if output:
-                s = _parse_job_status(output)
-                if s:
-                    tracker["jobs"][jid]["status"] = s
-                    update_job_status(jrun_dir, jid, s)
+            if tracker["jobs"][jid].get("status") != "Pending":
+                output = airsctl.job_list(jid)
+                if output:
+                    s = _parse_job_status(output)
+                    if s:
+                        tracker["jobs"][jid]["status"] = s
+                        update_job_status(jrun_dir, jid, s)
             jobs[jid] = tracker["jobs"][jid]
 
     if status_filter:
@@ -467,6 +419,7 @@ STATUS_COLORS = {
     "submitted": "yellow",
     "failed": "red",
     "stopped": "magenta",
+    "pending": "white",
 }
 
 
@@ -515,24 +468,40 @@ def _parse_job_status(output: str) -> str | None:
     return None
 
 
-def _resolve_job_id(name_or_id: str) -> str:
-    """Resolve a job name to its airsctl job ID. Pass through if already an ID."""
-    try:
-        settings, jrun_dir = load_settings()
-        result = find_job_by_name(jrun_dir, name_or_id)
-        if result:
-            return result[0]
-    except FileNotFoundError:
-        pass
-    return name_or_id
-
-
 @cli.command()
 @click.argument("name_or_id")
 def stop(name_or_id):
-    """Stop a running job by name or ID."""
-    job_id = _resolve_job_id(name_or_id)
-    airsctl.job_stop(job_id)
+    """Stop a running job or search scheduler by name or ID."""
+    settings, jrun_dir = load_settings()
+    tracker = load_tracker(jrun_dir)
+
+    # Check if it's a search name — stop scheduler + all active jobs
+    if name_or_id in tracker.get("searches", {}):
+        stopped_sched = stop_scheduler(jrun_dir, name_or_id)
+        if stopped_sched:
+            click.echo(f"Stopped scheduler for '{name_or_id}'")
+
+        search = tracker["searches"][name_or_id]
+        for jid in search.get("job_ids", []):
+            job_info = tracker["jobs"].get(jid, {})
+            if job_info.get("status") == "Pending":
+                update_job_status(jrun_dir, jid, "Stopped")
+            elif not jid.startswith("pending-"):
+                _log_airsctl_error(airsctl.job_stop(jid), "job stop")
+        click.echo(f"Stopped all jobs in search '{name_or_id}'")
+        return
+
+    # Single job
+    result = find_job_by_name(jrun_dir, name_or_id)
+    if result:
+        job_id, job_info = result
+        if job_info.get("status") == "Pending":
+            update_job_status(jrun_dir, job_id, "Stopped")
+            click.echo(f"Cancelled pending job '{name_or_id}'")
+            return
+        name_or_id = job_id
+
+    _log_airsctl_error(airsctl.job_stop(name_or_id), "job stop")
 
 
 @cli.command()
@@ -544,21 +513,35 @@ def remove(name_or_id):
     tracker = load_tracker(jrun_dir)
 
     if name_or_id in tracker.get("searches", {}):
+        # Stop scheduler daemon first
+        stop_scheduler(jrun_dir, name_or_id)
+
         search = tracker["searches"][name_or_id]
         job_ids = search.get("job_ids", [])
         click.echo(f"Removing search '{name_or_id}' ({len(job_ids)} jobs)")
         for jid in job_ids:
             job_info = tracker["jobs"].get(jid, {})
+            if jid.startswith("pending-"):
+                continue
             _remove_one_job(jid, job_info.get("name"), exp_id)
         remove_search(jrun_dir, name_or_id)
         click.echo(f"Search '{name_or_id}' removed.")
     else:
-        job_id = _resolve_job_id(name_or_id)
-        job_info = tracker.get("jobs", {}).get(job_id, {})
+        result = find_job_by_name(jrun_dir, name_or_id)
+        if result:
+            job_id, job_info = result
+        else:
+            job_id = name_or_id
+            job_info = tracker.get("jobs", {}).get(job_id, {})
+
         job_name = job_info.get("name", name_or_id)
-        _remove_one_job(job_id, job_name, exp_id)
-        remove_job(jrun_dir, job_id)
-        click.echo(f"Job '{job_name}' removed.")
+        if job_id.startswith("pending-"):
+            remove_job(jrun_dir, job_id)
+            click.echo(f"Pending job '{job_name}' removed.")
+        else:
+            _remove_one_job(job_id, job_name, exp_id)
+            remove_job(jrun_dir, job_id)
+            click.echo(f"Job '{job_name}' removed.")
 
 
 def _remove_one_job(job_id: str, config_name: str | None, exp_id: str | None):

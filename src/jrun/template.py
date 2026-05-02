@@ -76,9 +76,13 @@ search:
   # (optional, default 9999) Max parameter combinations.
   max_trials: 100
 
-  # (optional, TODO: not yet implemented, requires background daemon)
-  # Max concurrent jobs. Currently accepted but ignored.
+  # (optional) Max concurrent jobs on the platform. When set, submit sends the
+  # first N jobs immediately and a background scheduler submits the rest as
+  # slots open up.
   parallel_trials: 4
+
+  # (optional, default 30) Polling interval in seconds for the scheduler daemon.
+  poll_interval: 30
 
   # (required) Parameter list. All params are crossed (cartesian product).
   params:
@@ -121,9 +125,10 @@ job:
 # ==========================================================================
 # Variable Reference
 # ==========================================================================
-# $CONFIG_DIR  -> directory containing this config file
-# $HOME        -> user home directory
-# $$VAR        -> literal $VAR (for runtime environment variables)
+# $CONFIG_DIR  -> directory containing this config file (jrun built-in)
+# $VAR         -> resolved at submit time from local environment variables.
+#                 Errors if undefined.
+# $$VAR        -> becomes $VAR in the submitted command (remote env reference)
 # {param}      -> parameter value from search grid
 # {auto:Ns}    -> deterministic N-char MD5 hash based on parameters
 """

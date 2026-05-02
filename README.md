@@ -182,9 +182,9 @@ jrun list
 
 | Variable | Expands to |
 |---|---|
-| `$CONFIG_DIR` | Directory containing the config file |
-| `$HOME` | User home directory |
-| `$$VAR` | Literal `$VAR` (for runtime environment variables) |
+| `$CONFIG_DIR` | Directory containing the config file (jrun built-in) |
+| `$VAR` | Resolved at submit time from local environment variables. Errors if undefined |
+| `$$VAR` | Becomes `$VAR` in the submitted command (remote env reference) |
 | `{param}` | Parameter value from search grid |
 | `{auto:Ns}` | Deterministic N-char MD5 hash based on parameters |
 

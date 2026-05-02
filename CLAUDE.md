@@ -21,6 +21,8 @@ uv tool install .
 
 **Important:** Unset `http_proxy` and `https_proxy` environment variables before running jrun, or airsctl subprocess calls will fail.
 
+There is no test suite, linter, or formatter configured. No Makefile or CI pipeline exists.
+
 ## Key Commands
 
 ```bash
@@ -43,40 +45,42 @@ jrun list                                        # List all experiments
 
 ## Architecture
 
-All source lives in `src/jrun/`. The package has six modules:
+All source lives in `src/jrun/`. Entry point: `jrun = "jrun.cli:cli"` in pyproject.toml. Dependencies are only `click>=8.0` and `pyyaml>=6.0`.
 
-- **cli.py** — Click command group (`cli`). Entry point registered as `jrun = "jrun.cli:cli"` in pyproject.toml. Defines subcommands: `init`, `template`, `submit`, `status`, `stop`, `remove`, `list`. The `submit` command orchestrates: load config → expand grid → handle overwrite/skip logic → for each job: modify experiment via temp JSON → run job → record in tracker. Supports local execution when `queue_name` is `local`.
+- **cli.py** — Click command group. Defines subcommands: `init`, `template`, `submit`, `status`, `stop`, `remove`, `list`. The `submit` command is the most complex — it orchestrates config loading, grid expansion, overwrite/skip logic, and per-job submission. Contains `_submit_one_job()` which handles the experiment-modify-then-job-run flow.
 
-- **config.py** — YAML config loading and grid expansion. `load_config()` reads YAML with `$CONFIG_DIR`/`$HOME`/`$$VAR` variable substitution. `expand_grid()` does cartesian product over search params to produce job dicts (with `envs` support). `build_single_job()` handles the non-search case. `{auto:Ns}` in job names produces a deterministic MD5-based hash. Both `command` (string) and `commands` (list, joined with `&&`) are supported.
+- **config.py** — YAML config loading and grid expansion. `load_config()` does `$CONFIG_DIR`/`$HOME` substitution at the raw text level before YAML parsing. `expand_grid()` does cartesian product over search params. `_resolve_command()` handles both `command` (string) and `commands` (list, joined with `&&`), plus `$$` → `$` escaping and `{param}` substitution. `{auto:Ns}` in job names produces a deterministic MD5-based hash. Note: `build_single_job()` does NOT apply `$$` escaping — only `expand_grid` path does.
 
-- **airsctl.py** — Thin subprocess wrapper around the `airsctl` CLI binary. Functions: `experiment_list`, `experiment_modify`, `job_list`, `job_run`, `job_stop`, `job_cancel`.
+- **airsctl.py** — Thin subprocess wrapper. All calls go through `_run()` which prepends `airsctl` to args. Functions: `experiment_list`, `experiment_modify`, `job_list`, `job_run`, `job_stop`, `job_cancel`. No error handling on subprocess failures — callers check stdout.
 
-- **settings.py** — Manages `.jrun/settings.json` (experiment name/ID/platform IDs). `find_jrun_dir()` walks up the directory tree. `extract_platform_ids()` parses platform IDs from experiment data for building job URLs. `build_job_url()` constructs clickable platform links.
+- **settings.py** — Manages `.jrun/settings.json`. `find_jrun_dir()` walks up the directory tree from cwd. `extract_platform_ids()` parses `projsetId`/`projId`/`userId` from experiment storage_info for building platform URLs. The platform base URL is hardcoded.
 
-- **tracker.py** — Manages `.jrun/jobs.json` for local job tracking. Records searches (with constituent job IDs) and individual jobs. Supports: `record_search`, `record_single_job`, `find_job_by_name`, `remove_job`, `remove_search`, `update_job_status`.
+- **tracker.py** — Manages `.jrun/jobs.json`. Two-level structure: `searches` (name → config_file, submitted_at, job_ids) and `jobs` (id → name, search_name, params, status, submitted_at). `record_search()` merges new jobs with existing ones, keeping skipped jobs from prior runs.
 
-- **template.py** — Contains `TEMPLATE_CONTENT`, the annotated YAML config template string used by the `jrun template` command.
+- **template.py** — Contains `TEMPLATE_CONTENT`, the annotated YAML config template string.
+
+## Job Submission Flow (cli.py `_submit_one_job`)
+
+1. Fetch current experiment config via `airsctl experiment list -e <id>`
+2. Clone the first `advance_config_infos` entry as a template
+3. Set `config_name` to the job name, apply resource_config overrides
+4. Build worker config if `resource_config.worker` is present (multi-node)
+5. Merge environment variables into `envs` list (key-value dicts)
+6. Write modified experiment JSON to a temp file
+7. Call `airsctl experiment modify -f <tmp.json>` to register the config
+8. Call `airsctl job run -e <id> -n <config_name>` to start the job
+9. Parse job UUID from stdout regex (`[Jj]ob.*?([0-9a-f-]{36})`)
+10. Clean up temp file
 
 ## Config Format
 
-The code reads two top-level keys from YAML configs:
+Two mutually exclusive top-level keys:
 
-- **Grid search** — `search:` section with `job_template` (name, commands, envs, resource_config), `params` (list of name/values), `sampling: grid`, `max_trials`, `parallel_trials`.
-- **Single job** — `job:` section with `name`, `command`/`commands`, `envs`, `resource_config`.
-- **Multi-node job** — Single job with `resource_config.worker` containing `replicas` and optional resource overrides.
-- **Local job** — Single job with `resource_config.queue_name: local`, runs directly on the local machine.
+- **`search:`** — Grid search with `job_template` (name, commands, envs, resource_config), `params` (list of name/values), `sampling: grid`, `max_trials`, `parallel_trials` (not yet implemented).
+- **`job:`** — Single job with `name`, `command`/`commands`, `envs`, `resource_config`.
 
-Resource config fields: `queue_name`, `priority`, `accelerator_model`, `accelerator_count`, `cpu_cores`, `mem_gib`, `shared_mem_gib`, `worker` (replicas + resource overrides).
+Special cases:
+- `resource_config.queue_name: local` → runs command locally via `subprocess.run(shell=True)` instead of submitting
+- `resource_config.worker.replicas` → multi-node job with master + worker pods
 
-## Job Submission Flow
-
-1. Load YAML config and expand grid parameters
-2. Check for existing jobs with same name — prompt or auto-overwrite based on flags
-3. Teardown old jobs if overwriting (stop + remove config + remove from tracker)
-4. Fetch current experiment config from airsctl (`experiment list -e <id>`)
-5. Clone the first existing `advance_config_infos` entry as a template
-6. Apply resource_config overrides, worker config, and environment variables
-7. Write modified experiment config to a temp JSON file
-8. Call `airsctl experiment modify -f <tmp.json>` to register the new config
-9. Call `airsctl job run` with experiment + config name to start the job
-10. Parse job UUID from stdout and record in `.jrun/jobs.json`
+Variable substitution (all resolved in `load_config()` at the raw text level before YAML parsing): `$CONFIG_DIR` (jrun built-in), `$VAR` (local env, errors if undefined), `$$VAR` → `$VAR` (remote env passthrough), `{param}` (grid params), `{auto:Ns}` (MD5 hash).

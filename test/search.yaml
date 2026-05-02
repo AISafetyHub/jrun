@@ -12,9 +12,9 @@ search:
         MODEL_NAME: "{model}",
       }
     resource_config:
-      queue_name: baai-safety_research_safety-research
+      queue_name: baai-safety_research_yybu-private
       priority: high
-      accelerator_model: J1_ADV_H1-SXM4-80GB
+      accelerator_model: NVIDIA_A100-SXM4-40GB
       accelerator_count: 0
       cpu_cores: 8
       mem_gib: 128

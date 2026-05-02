@@ -11,9 +11,28 @@ def load_config(config_path: str) -> dict:
     with open(config_path) as f:
         raw = f.read()
 
-    config_dir = str(config_path.parent)
-    raw = raw.replace("$CONFIG_DIR", config_dir)
-    raw = raw.replace("$HOME", os.environ.get("HOME", "~"))
+    jrun_vars = {
+        "CONFIG_DIR": str(config_path.parent),
+    }
+
+    # Protect $$ (remote env refs) with placeholder
+    placeholder = "\x00DOLLAR\x00"
+    raw = raw.replace("$$", placeholder)
+
+    # Resolve $VAR against jrun vars and local environment
+    def _resolve(m):
+        name = m.group(1)
+        if name in jrun_vars:
+            return jrun_vars[name]
+        val = os.environ.get(name)
+        if val is not None:
+            return val
+        raise ValueError(f"Undefined variable: ${name}")
+
+    raw = re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", _resolve, raw)
+
+    # Restore $$ → $ (remote env refs, passed through to remote shell)
+    raw = raw.replace(placeholder, "$")
 
     config = yaml.safe_load(raw)
     return config
@@ -37,14 +56,12 @@ def _resolve_command(cmd_raw, mapping: dict) -> str:
             resolved = str(cmd)
             for k, v in mapping.items():
                 resolved = resolved.replace(f"{{{k}}}", str(v))
-            resolved = resolved.replace("$$", "$")
             parts.append(resolved)
         return " && ".join(parts)
     else:
         resolved = str(cmd_raw)
         for k, v in mapping.items():
             resolved = resolved.replace(f"{{{k}}}", str(v))
-        resolved = resolved.replace("$$", "$")
         return resolved
 
 
@@ -56,6 +73,10 @@ def expand_grid(config: dict) -> list[dict]:
     search = config.get("search")
     if not search:
         return []
+
+    sampling = search.get("sampling", "grid")
+    if sampling != "grid":
+        raise ValueError(f"Unsupported sampling method: '{sampling}'. Only 'grid' is supported.")
 
     template = search["job_template"]
     params = search.get("params", [])
@@ -85,7 +106,6 @@ def expand_grid(config: dict) -> list[dict]:
                 val = str(ev)
                 for k, v in mapping.items():
                     val = val.replace(f"{{{k}}}", str(v))
-                val = val.replace("$$", "$")
                 resolved_envs[ek] = val
             envs = resolved_envs
 
@@ -105,17 +125,16 @@ def build_single_job(config: dict) -> dict | None:
     job = config.get("job")
     if not job:
         return None
-    cmd_raw = job.get("commands", job.get("command", ""))
-    if isinstance(cmd_raw, list):
-        command = " && ".join(str(c) for c in cmd_raw)
-    else:
-        command = str(cmd_raw)
+    command = _resolve_command(job.get("commands", job.get("command", "")), {})
+
+    envs = job.get("envs", {})
+
     return {
         "name": job["name"],
         "command": command,
         "params": {},
         "resource_config": job.get("resource_config", {}),
-        "envs": job.get("envs", {}),
+        "envs": envs,
     }
 
 
@@ -130,3 +149,11 @@ def get_search_name(config: dict) -> str | None:
     clean = re.sub(r"\{[^}]+\}", "", name_tmpl)
     clean = re.sub(r"_+", "_", clean).strip("_")
     return clean
+
+
+def get_scheduler_params(config: dict) -> dict:
+    search = config.get("search", {})
+    return {
+        "parallel_trials": search.get("parallel_trials"),
+        "poll_interval": search.get("poll_interval", 30),
+    }

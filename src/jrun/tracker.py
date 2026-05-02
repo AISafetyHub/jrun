@@ -114,3 +114,61 @@ def update_job_status(jrun_dir: Path, job_id: str, status: str):
     if job_id in tracker["jobs"]:
         tracker["jobs"][job_id]["status"] = status
         save_tracker(jrun_dir, tracker)
+
+
+def record_pending_jobs(jrun_dir: Path, search_name: str, config_file: str, jobs: list[dict]):
+    """Record jobs as Pending in tracker. Each job gets a temporary ID 'pending-<hash>'."""
+    import hashlib
+    tracker = load_tracker(jrun_dir)
+    now = datetime.now().isoformat(timespec="seconds")
+
+    job_ids = []
+    for j in jobs:
+        pending_id = "pending-" + hashlib.md5(j["name"].encode()).hexdigest()[:12]
+        job_ids.append(pending_id)
+        tracker["jobs"][pending_id] = {
+            "name": j["name"],
+            "search_name": search_name,
+            "params": j.get("params", {}),
+            "status": "Pending",
+            "submitted_at": now,
+            "job_data": {
+                "name": j["name"],
+                "command": j["command"],
+                "params": j.get("params", {}),
+                "resource_config": j.get("resource_config", {}),
+                "envs": j.get("envs", {}),
+            },
+        }
+
+    existing_search = tracker["searches"].get(search_name)
+    old_job_ids = existing_search["job_ids"] if existing_search else []
+    new_names = {j["name"] for j in jobs}
+    kept_ids = [
+        jid for jid in old_job_ids
+        if jid in tracker.get("jobs", {}) and tracker["jobs"][jid].get("name") not in new_names
+    ]
+    tracker["searches"][search_name] = {
+        "config_file": config_file,
+        "submitted_at": now,
+        "job_ids": kept_ids + job_ids,
+    }
+    save_tracker(jrun_dir, tracker)
+    return job_ids
+
+
+def replace_pending_with_real(jrun_dir: Path, pending_id: str, real_job_id: str):
+    """Replace a pending job entry with the real job ID after submission."""
+    tracker = load_tracker(jrun_dir)
+    if pending_id not in tracker["jobs"]:
+        return
+    job_info = tracker["jobs"].pop(pending_id)
+    job_info["status"] = "Submitted"
+    job_info.pop("job_data", None)
+    tracker["jobs"][real_job_id] = job_info
+
+    for search in tracker["searches"].values():
+        ids = search.get("job_ids", [])
+        search["job_ids"] = [real_job_id if jid == pending_id else jid for jid in ids]
+
+    save_tracker(jrun_dir, tracker)
