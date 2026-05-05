@@ -380,6 +380,20 @@ def _show_all_jobs(tracker: dict, status_filter: set | None = None, max_jobs: in
                 info["status"] = s
                 update_job_status(jrun_dir, jid, s)
 
+    # Refresh status for search jobs
+    for sname, sinfo in searches.items():
+        for jid in sinfo.get("job_ids", []):
+            if jid not in all_jobs or jid.startswith("pending-"):
+                continue
+            if all_jobs[jid].get("status") in {"Completed", "Succeed", "Failed", "Stopped", "Cancelled", "Canceled"}:
+                continue
+            output = airsctl.job_list(jid)
+            if output:
+                s = _parse_job_status(output)
+                if s:
+                    all_jobs[jid]["status"] = s
+                    update_job_status(jrun_dir, jid, s)
+
     # Build rows: (name, status_display, submitted_at, job_id_or_none, row_type)
     rows = []
 
@@ -587,9 +601,9 @@ def stop(name_or_id):
         search = tracker["searches"][name_or_id]
         for jid in search.get("job_ids", []):
             job_info = tracker["jobs"].get(jid, {})
-            if job_info.get("status") == "Pending":
+            if jid.startswith("pending-"):
                 update_job_status(jrun_dir, jid, "Stopped")
-            elif not jid.startswith("pending-"):
+            else:
                 _log_airsctl_error(airsctl.job_stop(jid), "job stop")
         click.echo(f"Stopped all jobs in search '{name_or_id}'")
         return
@@ -598,7 +612,7 @@ def stop(name_or_id):
     result = find_job_by_name(jrun_dir, name_or_id)
     if result:
         job_id, job_info = result
-        if job_info.get("status") == "Pending":
+        if job_id.startswith("pending-"):
             update_job_status(jrun_dir, job_id, "Stopped")
             click.echo(f"Cancelled pending job '{name_or_id}'")
             return

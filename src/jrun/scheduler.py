@@ -13,7 +13,7 @@ from pathlib import Path
 
 from jrun import airsctl
 from jrun.submit import submit_one_job
-from jrun.tracker import load_tracker, save_tracker, update_job_status
+from jrun.tracker import load_tracker, save_tracker, update_job_status, locked_tracker
 
 
 TERMINAL_STATUSES = {"Completed", "Succeed", "Failed", "Stopped"}
@@ -172,39 +172,64 @@ def run_scheduler(args: dict):
         if to_submit:
             _log(f"Active: {active_count}, Pending: {len(pending_ids)}, Submitting: {len(to_submit)}")
 
+        consecutive_failures = 0
         for pending_id in to_submit:
-            tracker = load_tracker(jrun_dir)
-            job_info = tracker["jobs"].get(pending_id)
-            if not job_info or job_info["status"] != "Pending":
+            # Re-check under lock that this job is still pending
+            with locked_tracker(jrun_dir) as tr:
+                job_info = tr["jobs"].get(pending_id)
+                if not job_info or job_info["status"] != "Pending":
+                    continue
+                job_data = job_info.get("job_data", {})
+                job_name = job_info["name"]
+                job_params = job_info.get("params", {})
+
+            if not job_data.get("name"):
+                _log(f"Skipping {pending_id}: missing job_data")
                 continue
 
-            job_data = job_info.get("job_data", {})
-            _log(f"Submitting: {job_info['name']}")
+            _log(f"Submitting: {job_name}")
 
-            real_job_id = submit_one_job(job_data, exp_name, exp_id, log_fn=_log_fn)
+            # Retry with backoff on transient failures
+            real_job_id = None
+            for attempt in range(3):
+                real_job_id = submit_one_job(job_data, exp_name, exp_id, log_fn=_log_fn)
+                if real_job_id:
+                    break
+                if attempt < 2:
+                    wait = 5 * (attempt + 1)
+                    _log(f"  Retry {attempt + 1}/2 in {wait}s...")
+                    time.sleep(wait)
 
-            tracker = load_tracker(jrun_dir)
-            if real_job_id:
-                _log(f"Submitted: {job_info['name']} -> {real_job_id[:8]}")
-                tracker["jobs"][real_job_id] = {
-                    "name": job_info["name"],
-                    "search_name": search_name,
-                    "params": job_info.get("params", {}),
-                    "status": "Submitted",
-                    "submitted_at": datetime.now().isoformat(timespec="seconds"),
-                }
-                tracker["jobs"].pop(pending_id, None)
-                search_data = tracker["searches"].get(search_name)
-                if search_data:
-                    search_data["job_ids"] = [
-                        real_job_id if jid == pending_id else jid
-                        for jid in search_data["job_ids"]
-                    ]
-            else:
-                _log(f"Failed to submit: {job_info['name']}, marking as Failed")
-                tracker["jobs"][pending_id]["status"] = "Failed"
+            # Update tracker under lock
+            with locked_tracker(jrun_dir) as tr:
+                if real_job_id:
+                    consecutive_failures = 0
+                    _log(f"Submitted: {job_name} -> {real_job_id[:8]}")
+                    tr["jobs"][real_job_id] = {
+                        "name": job_name,
+                        "search_name": search_name,
+                        "params": job_params,
+                        "status": "Submitted",
+                        "submitted_at": datetime.now().isoformat(timespec="seconds"),
+                    }
+                    tr["jobs"].pop(pending_id, None)
+                    search_data = tr["searches"].get(search_name)
+                    if search_data:
+                        search_data["job_ids"] = [
+                            real_job_id if jid == pending_id else jid
+                            for jid in search_data["job_ids"]
+                        ]
+                else:
+                    consecutive_failures += 1
+                    _log(f"Failed to submit after retries: {job_name}, keeping as Pending")
 
-            save_tracker(jrun_dir, tracker)
+            # If too many consecutive failures, back off this entire round
+            if consecutive_failures >= 3:
+                _log(f"Too many consecutive failures, backing off until next poll")
+                break
+
+            # Throttle between submissions
+            time.sleep(2)
 
         # Check if done
         tracker = load_tracker(jrun_dir)
