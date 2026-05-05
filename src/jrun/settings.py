@@ -6,7 +6,7 @@ from urllib.parse import urlencode
 JRUN_DIR = ".jrun"
 SETTINGS_FILE = "settings.json"
 
-PLATFORM_BASE_URL = "http://platform-cuihu.jingneng-inner.ac.cn/platform/modelTraining/jobList/jobDetail"
+PLATFORM_BASE_URL = "https://platform.baai.ac.cn/platform/modelTraining/jobList/jobDetail"
 
 
 def find_jrun_dir(start: Path | None = None) -> Path:
@@ -41,22 +41,26 @@ def save_settings(data: dict, directory: Path | None = None) -> Path:
 
 
 def extract_platform_ids(experiment_json: dict) -> dict | None:
-    """Extract projsetId, projId, userId from airsctl experiment list output."""
+    """Extract projsetId, projId, userId, projsetName, projectName from airsctl experiment list output."""
     storage = experiment_json.get("storage_info", [])
     if not storage:
         return None
     entry = storage[0]
     user_id = entry.get("user_id")
     volumes_path = entry.get("volumes_path", "")
-    # volumes_path looks like: /mnt/.../1449ba9c-..._102db38c-.../10172
     match = re.search(r"/([0-9a-f-]{36})_([0-9a-f-]{36})/", volumes_path)
     if not match or not user_id:
         return None
-    return {
+    result = {
         "projsetId": match.group(1),
         "projId": match.group(2),
         "userId": str(user_id),
     }
+    if experiment_json.get("projset_name"):
+        result["projsetName"] = experiment_json["projset_name"]
+    if experiment_json.get("project_name"):
+        result["projectName"] = experiment_json["project_name"]
+    return result
 
 
 def build_job_url(settings: dict, job_id: str) -> str | None:
@@ -71,4 +75,12 @@ def build_job_url(settings: dict, job_id: str) -> str | None:
         "projsetId": platform["projsetId"],
         "userId": platform["userId"],
     }
-    return f"{PLATFORM_BASE_URL}?{urlencode(params)}"
+    url = f"{PLATFORM_BASE_URL}?{urlencode(params)}"
+    fragment_parts = {}
+    if platform.get("projsetName"):
+        fragment_parts["projsetName"] = platform["projsetName"]
+    if platform.get("projectName"):
+        fragment_parts["projectName"] = platform["projectName"]
+    if fragment_parts:
+        url += f"#{urlencode(fragment_parts)}"
+    return url

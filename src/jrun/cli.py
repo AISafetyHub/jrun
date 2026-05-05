@@ -225,6 +225,7 @@ def submit(config_file, dry_run, overwrite, status):
             click.echo(f"Submitted {len(job_entries)} jobs, {len(pending)} pending")
             click.echo(f"Scheduler daemon started (pid={pid}, poll={sched_params['poll_interval']}s)")
             click.echo(f"  Log: {jrun_dir / 'scheduler' / f'{search_name}.log'}")
+            _show_submitted_jobs(jrun_dir, [e["job_id"] for e in job_entries], settings)
         else:
             # Original behavior: submit all at once
             job_entries = []
@@ -239,6 +240,7 @@ def submit(config_file, dry_run, overwrite, status):
                         })
             record_search(jrun_dir, search_name, config_file, job_entries)
             click.echo(f"\nSubmitted {len(job_entries)} jobs under search '{search_name}'")
+            _show_submitted_jobs(jrun_dir, [e["job_id"] for e in job_entries], settings)
 
     else:
         job = build_single_job(config)
@@ -293,7 +295,28 @@ def submit(config_file, dry_run, overwrite, status):
         if job_id:
             record_single_job(jrun_dir, job_id, job["name"])
             click.echo(f"Submitted → {job_id[:8]}")
+            _show_submitted_jobs(jrun_dir, [job_id], settings)
 
+
+
+def _show_submitted_jobs(jrun_dir, job_ids: list, settings: dict):
+    """Show a status table for the just-submitted jobs."""
+    tracker = load_tracker(jrun_dir)
+    jobs = {}
+    for jid in job_ids:
+        if jid in tracker.get("jobs", {}):
+            info = tracker["jobs"][jid]
+            if info.get("status") != "Pending":
+                output = airsctl.job_list(jid)
+                if output:
+                    s = _parse_job_status(output)
+                    if s:
+                        info["status"] = s
+                        update_job_status(jrun_dir, jid, s)
+            jobs[jid] = info
+    if jobs:
+        click.echo()
+        _print_job_table(jobs, settings)
 
 
 def _click_log_fn(msg, err=False):
@@ -307,34 +330,48 @@ def _submit_one_job(job: dict, exp_name: str | None, exp_id: str | None, quiet: 
 @cli.command()
 @click.argument("name_or_id", required=False)
 @click.option("--status", "-s", multiple=True, help="Only show jobs with this status (can be repeated)")
-def status(name_or_id, status):
+@click.option("--max", "-n", "max_jobs", default=10, show_default=True, help="Max number of jobs to display")
+def status(name_or_id, status, max_jobs):
     """Show job status. Optionally filter by search name or job ID."""
     settings, jrun_dir = load_settings()
     tracker = load_tracker(jrun_dir)
     status_filter = set(status) if status else None
 
     if not name_or_id:
-        _show_all_jobs(tracker, status_filter)
+        _show_all_jobs(tracker, status_filter, max_jobs)
     elif name_or_id in tracker.get("searches", {}):
-        _show_search_jobs(tracker, name_or_id, jrun_dir, status_filter)
+        _show_search_jobs(tracker, name_or_id, jrun_dir, status_filter, max_jobs)
     else:
         result = find_job_by_name(jrun_dir, name_or_id)
         if result:
             job_id, _ = result
             _show_single_job(job_id, tracker, jrun_dir)
-        else:
+        elif name_or_id in tracker.get("jobs", {}):
             _show_single_job(name_or_id, tracker, jrun_dir)
+        else:
+            click.echo(f"No job or search found matching '{name_or_id}'.")
 
 
-def _show_all_jobs(tracker: dict, status_filter: set | None = None):
+def _show_all_jobs(tracker: dict, status_filter: set | None = None, max_jobs: int = 10):
+    from collections import Counter
+
     settings, jrun_dir = load_settings()
-    jobs = tracker.get("jobs", {})
-    if not jobs:
+    all_jobs = tracker.get("jobs", {})
+    searches = tracker.get("searches", {})
+
+    if not all_jobs and not searches:
         click.echo("No jobs tracked. Submit some jobs first.")
         return
 
-    for jid, info in jobs.items():
-        if info.get("status") == "Pending":
+    # Standalone jobs: not belonging to any search
+    standalone_jobs = {
+        jid: info for jid, info in all_jobs.items()
+        if info.get("search_name") is None
+    }
+
+    # Refresh status for standalone jobs only
+    for jid, info in standalone_jobs.items():
+        if jid.startswith("pending-"):
             continue
         output = airsctl.job_list(jid)
         if output:
@@ -343,19 +380,69 @@ def _show_all_jobs(tracker: dict, status_filter: set | None = None):
                 info["status"] = s
                 update_job_status(jrun_dir, jid, s)
 
-    if status_filter:
-        jobs = {jid: info for jid, info in jobs.items() if info.get("status") in status_filter}
+    # Build rows: (name, status_display, submitted_at, job_id_or_none, row_type)
+    rows = []
 
-    _print_job_table(jobs, settings)
+    # Search summary rows
+    for sname, sinfo in searches.items():
+        job_ids = sinfo.get("job_ids", [])
+        statuses = [all_jobs[jid].get("status", "?") for jid in job_ids if jid in all_jobs]
+        if status_filter and not any(s in status_filter for s in statuses):
+            continue
+        counts = Counter(statuses)
+        summary = ", ".join(f"{v} {k}" for k, v in counts.items())
+        n_jobs = len(job_ids)
+        rows.append((f"{sname} ({n_jobs} jobs)", summary, sinfo.get("submitted_at", ""), None, "search"))
+
+    # Standalone job rows
+    for jid, info in standalone_jobs.items():
+        if status_filter and info.get("status") not in status_filter:
+            continue
+        rows.append((info["name"], info.get("status", "?"), info.get("submitted_at", ""), jid, "job"))
+
+    if not rows:
+        click.echo("No jobs match the filter.")
+        return
+
+    total = len(rows)
+    if max_jobs > 0 and total > max_jobs:
+        rows = rows[:max_jobs]
+
+    # Print table
+    has_links = settings and settings.get("platform")
+    max_name_len = max(len(r[0]) for r in rows)
+    max_status_len = max(len(r[1]) for r in rows)
+    name_width = max(max_name_len, 4) + 2
+    status_width = max(max_status_len, 6) + 2
+
+    header = f"{'NAME':<{name_width}} {'STATUS':<{status_width}} {'SUBMITTED':<20}"
+    if has_links:
+        header += " LINK"
+    click.echo(header)
+    click.echo("-" * len(header))
+
+    for name, status_str, submitted_at, job_id, row_type in rows:
+        if row_type == "search":
+            line = f"{name:<{name_width}} {status_str:<{status_width}} {submitted_at:<20}"
+        else:
+            line = f"{name:<{name_width}} {_colored_status(status_str, status_width)} {submitted_at:<20}"
+            if has_links and job_id:
+                url = build_job_url(settings, job_id)
+                if url:
+                    line += f" {_hyperlink(url, 'url')}"
+        click.echo(line)
+
+    if max_jobs > 0 and total > max_jobs:
+        click.echo(f"\n... showing {max_jobs}/{total} entries (use -n to show more)")
 
     # Show scheduler info for active searches
-    for sname in tracker.get("searches", {}):
+    for sname in searches:
         pid = is_scheduler_running(jrun_dir, sname)
         if pid:
             click.echo(f"\nScheduler active for '{sname}' (pid={pid})")
 
 
-def _show_search_jobs(tracker: dict, search_name: str, jrun_dir: Path, status_filter: set | None = None):
+def _show_search_jobs(tracker: dict, search_name: str, jrun_dir: Path, status_filter: set | None = None, max_jobs: int = 10):
     settings, _ = load_settings()
     search = tracker["searches"][search_name]
     click.echo(f"Search: {search_name}")
@@ -370,7 +457,7 @@ def _show_search_jobs(tracker: dict, search_name: str, jrun_dir: Path, status_fi
     jobs = {}
     for jid in search["job_ids"]:
         if jid in tracker["jobs"]:
-            if tracker["jobs"][jid].get("status") != "Pending":
+            if not jid.startswith("pending-"):
                 output = airsctl.job_list(jid)
                 if output:
                     s = _parse_job_status(output)
@@ -382,7 +469,14 @@ def _show_search_jobs(tracker: dict, search_name: str, jrun_dir: Path, status_fi
     if status_filter:
         jobs = {jid: info for jid, info in jobs.items() if info.get("status") in status_filter}
 
+    total = len(jobs)
+    if max_jobs > 0 and total > max_jobs:
+        jobs = dict(list(jobs.items())[:max_jobs])
+
     _print_job_table(jobs, settings)
+
+    if max_jobs > 0 and total > max_jobs:
+        click.echo(f"\n... showing {max_jobs}/{total} jobs (use -n to show more)")
 
 
 def _show_single_job(job_id: str, tracker: dict, jrun_dir):
@@ -419,7 +513,8 @@ STATUS_COLORS = {
     "submitted": "yellow",
     "failed": "red",
     "stopped": "magenta",
-    "pending": "white",
+    "cancelled": "magenta",
+    "pending": "bright_black",
 }
 
 
@@ -459,10 +554,18 @@ def _print_job_table(jobs: dict, settings: dict | None = None):
 
 
 def _parse_job_status(output: str) -> str | None:
-    """Try to extract status from airsctl job list output."""
+    """Extract status from airsctl job list output."""
+    try:
+        data = json.loads(output)
+        if isinstance(data, dict) and "status" in data:
+            return data["status"].capitalize()
+    except (json.JSONDecodeError, ValueError, AttributeError):
+        pass
+    # Fallback: line-based matching for non-JSON output
     for line in output.splitlines():
-        lower = line.lower()
-        for s in ("running", "completed", "succeed", "failed", "stopped", "queued", "starting"):
+        lower = line.lower().strip()
+        for s in ("cancelled", "failed", "stopped", "succeed", "completed",
+                  "running", "starting", "scheduling", "queued", "submitted"):
             if s in lower:
                 return s.capitalize()
     return None

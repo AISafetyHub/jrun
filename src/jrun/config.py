@@ -57,7 +57,7 @@ def _resolve_command(cmd_raw, mapping: dict) -> str:
             for k, v in mapping.items():
                 resolved = resolved.replace(f"{{{k}}}", str(v))
             parts.append(resolved)
-        return " && ".join(parts)
+        return "\n".join(parts)
     else:
         resolved = str(cmd_raw)
         for k, v in mapping.items():
