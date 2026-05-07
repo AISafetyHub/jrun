@@ -16,14 +16,23 @@ from jrun.submit import submit_one_job
 from jrun.tracker import load_tracker, save_tracker, update_job_status, locked_tracker
 
 
-TERMINAL_STATUSES = {"Completed", "Succeed", "Failed", "Stopped"}
-ACTIVE_STATUSES = {"Submitted", "Running", "Queued", "Starting", "Scheduling"}
+TERMINAL_STATUSES = {"Completed", "Succeed", "Failed", "Stopped", "Cancelled"}
+ACTIVE_STATUSES = {"Submitted", "Running", "Pending", "Queued", "Starting", "Scheduling"}
 
 
 def _parse_job_status(output: str) -> str | None:
+    # airsctl job list -j returns JSON with a top-level "status" field.
+    # Avoid keyword scanning which can match historical states in the "states" field.
+    try:
+        data = json.loads(output)
+        if isinstance(data, dict) and "status" in data:
+            return data["status"]
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # Fallback: line-based keyword scan for non-JSON output (e.g. table format)
     for line in output.splitlines():
         lower = line.lower()
-        for s in ("running", "completed", "succeed", "failed", "stopped", "queued", "starting"):
+        for s in ("running", "completed", "succeed", "failed", "stopped", "cancelled", "queued", "starting"):
             if s in lower:
                 return s.capitalize()
     return None
@@ -136,7 +145,7 @@ def run_scheduler(args: dict):
             _log(f"Search '{search_name}' not found in tracker, exiting")
             break
 
-        pending_ids = []
+        queued_ids = []
         active_count = 0
 
         for jid in search["job_ids"]:
@@ -149,15 +158,15 @@ def run_scheduler(args: dict):
             if status in TERMINAL_STATUSES:
                 continue
 
-            if status == "Pending":
-                pending_ids.append(jid)
+            if status == "Queued":
+                queued_ids.append(jid)
                 continue
 
             # Active job — refresh status from platform
-            if not jid.startswith("pending-"):
-                output = airsctl.job_list(jid)
-                if output:
-                    new_status = _parse_job_status(output)
+            if not jid.startswith("queued-"):
+                result = airsctl.job_list(jid)
+                if result.returncode == 0 and result.stdout:
+                    new_status = _parse_job_status(result.stdout)
                     if new_status and new_status != status:
                         _log(f"Job {job_info['name']} ({jid[:8]}): {status} -> {new_status}")
                         update_job_status(jrun_dir, jid, new_status)
@@ -167,24 +176,23 @@ def run_scheduler(args: dict):
                 active_count += 1
 
         slots = max(0, parallel_trials - active_count)
-        to_submit = pending_ids[:slots]
+        to_submit = queued_ids[:slots]
 
         if to_submit:
-            _log(f"Active: {active_count}, Pending: {len(pending_ids)}, Submitting: {len(to_submit)}")
+            _log(f"Active: {active_count}, Queued: {len(queued_ids)}, Submitting: {len(to_submit)}")
 
         consecutive_failures = 0
-        for pending_id in to_submit:
-            # Re-check under lock that this job is still pending
+        for queued_id in to_submit:
             with locked_tracker(jrun_dir) as tr:
-                job_info = tr["jobs"].get(pending_id)
-                if not job_info or job_info["status"] != "Pending":
+                job_info = tr["jobs"].get(queued_id)
+                if not job_info or job_info["status"] != "Queued":
                     continue
                 job_data = job_info.get("job_data", {})
                 job_name = job_info["name"]
                 job_params = job_info.get("params", {})
 
             if not job_data.get("name"):
-                _log(f"Skipping {pending_id}: missing job_data")
+                _log(f"Skipping {queued_id}: missing job_data")
                 continue
 
             _log(f"Submitting: {job_name}")
@@ -212,16 +220,16 @@ def run_scheduler(args: dict):
                         "status": "Submitted",
                         "submitted_at": datetime.now().isoformat(timespec="seconds"),
                     }
-                    tr["jobs"].pop(pending_id, None)
+                    tr["jobs"].pop(queued_id, None)
                     search_data = tr["searches"].get(search_name)
                     if search_data:
                         search_data["job_ids"] = [
-                            real_job_id if jid == pending_id else jid
+                            real_job_id if jid == queued_id else jid
                             for jid in search_data["job_ids"]
                         ]
                 else:
                     consecutive_failures += 1
-                    _log(f"Failed to submit after retries: {job_name}, keeping as Pending")
+                    _log(f"Failed to submit after retries: {job_name}, keeping as Queued")
 
             # If too many consecutive failures, back off this entire round
             if consecutive_failures >= 3:
@@ -237,18 +245,18 @@ def run_scheduler(args: dict):
         if not search:
             break
 
-        has_pending = False
+        has_queued = False
         has_active = False
         for jid in search["job_ids"]:
             job_info = tracker["jobs"].get(jid)
             if not job_info:
                 continue
-            if job_info["status"] == "Pending":
-                has_pending = True
+            if job_info["status"] == "Queued":
+                has_queued = True
             elif job_info["status"] in ACTIVE_STATUSES:
                 has_active = True
 
-        if not has_pending and not has_active:
+        if not has_queued and not has_active:
             _log("All jobs completed, scheduler exiting")
             break
 

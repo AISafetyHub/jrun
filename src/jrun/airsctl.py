@@ -23,11 +23,11 @@ def experiment_modify(config_path: str) -> subprocess.CompletedProcess:
     return _run(["experiment", "modify", "-f", config_path])
 
 
-def job_list(job_id: str | None = None) -> str:
+def job_list(job_id: str | None = None) -> subprocess.CompletedProcess:
     args = ["job", "list"]
     if job_id:
         args += ["-j", job_id]
-    return _run(args).stdout
+    return _run(args)
 
 
 def job_run(

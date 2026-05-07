@@ -186,12 +186,26 @@ def submit(config_file, dry_run, overwrite, status):
 
         # Phase 3: teardown old jobs
         if overwrite_jobs:
-            click.echo("Cleaning up old jobs...")
-            for j, old_id, old_status in overwrite_jobs:
+            click.echo(f"Cleaning up {len(overwrite_jobs)} old jobs...")
+            for i, (j, old_id, old_status) in enumerate(overwrite_jobs, 1):
+                click.echo(f"  [{i}/{len(overwrite_jobs)}] Cancelling {j['name']}...", nl=False)
                 if old_status in ("Submitted", "Running", "Queued", "Starting", "Scheduling"):
                     _log_airsctl_error(airsctl.job_stop(old_id), "job stop")
-                settings_tmp, _ = load_settings()
-                _remove_one_job(old_id, j["name"], settings_tmp.get("experiment_id"))
+                if not old_id.startswith("queued-"):
+                    _log_airsctl_error(airsctl.job_cancel(old_id), "job cancel")
+                click.echo(" done")
+
+            # Batch remove configs from experiment in one modify call
+            click.echo("  Removing configs from experiment...", nl=False)
+            settings_tmp, _ = load_settings()
+            exp_id_tmp = settings_tmp.get("experiment_id")
+            if exp_id_tmp:
+                names_to_remove = {j["name"] for j, _, _ in overwrite_jobs}
+                _remove_configs_from_experiment(exp_id_tmp, names_to_remove)
+            click.echo(" done")
+
+            # Remove from tracker
+            for j, old_id, old_status in overwrite_jobs:
                 remove_job(jrun_dir, old_id)
 
         # Phase 4: submit
@@ -222,7 +236,7 @@ def submit(config_file, dry_run, overwrite, status):
                 jrun_dir, search_name, exp_name, exp_id,
                 parallel, sched_params["poll_interval"], pending,
             )
-            click.echo(f"Submitted {len(job_entries)} jobs, {len(pending)} pending")
+            click.echo(f"Submitted {len(job_entries)} jobs, {len(pending)} queued")
             click.echo(f"Scheduler daemon started (pid={pid}, poll={sched_params['poll_interval']}s)")
             click.echo(f"  Log: {jrun_dir / 'scheduler' / f'{search_name}.log'}")
             _show_submitted_jobs(jrun_dir, [e["job_id"] for e in job_entries], settings)
@@ -306,10 +320,10 @@ def _show_submitted_jobs(jrun_dir, job_ids: list, settings: dict):
     for jid in job_ids:
         if jid in tracker.get("jobs", {}):
             info = tracker["jobs"][jid]
-            if info.get("status") != "Pending":
-                output = airsctl.job_list(jid)
-                if output:
-                    s = _parse_job_status(output)
+            if info.get("status") != "Queued":
+                result = airsctl.job_list(jid)
+                if result.returncode == 0 and result.stdout:
+                    s = _parse_job_status(result.stdout)
                     if s:
                         info["status"] = s
                         update_job_status(jrun_dir, jid, s)
@@ -371,11 +385,11 @@ def _show_all_jobs(tracker: dict, status_filter: set | None = None, max_jobs: in
 
     # Refresh status for standalone jobs only
     for jid, info in standalone_jobs.items():
-        if jid.startswith("pending-"):
+        if jid.startswith("queued-"):
             continue
-        output = airsctl.job_list(jid)
-        if output:
-            s = _parse_job_status(output)
+        result = airsctl.job_list(jid)
+        if result.returncode == 0 and result.stdout:
+            s = _parse_job_status(result.stdout)
             if s:
                 info["status"] = s
                 update_job_status(jrun_dir, jid, s)
@@ -383,13 +397,13 @@ def _show_all_jobs(tracker: dict, status_filter: set | None = None, max_jobs: in
     # Refresh status for search jobs
     for sname, sinfo in searches.items():
         for jid in sinfo.get("job_ids", []):
-            if jid not in all_jobs or jid.startswith("pending-"):
+            if jid not in all_jobs or jid.startswith("queued-"):
                 continue
             if all_jobs[jid].get("status") in {"Completed", "Succeed", "Failed", "Stopped", "Cancelled", "Canceled"}:
                 continue
-            output = airsctl.job_list(jid)
-            if output:
-                s = _parse_job_status(output)
+            result = airsctl.job_list(jid)
+            if result.returncode == 0 and result.stdout:
+                s = _parse_job_status(result.stdout)
                 if s:
                     all_jobs[jid]["status"] = s
                     update_job_status(jrun_dir, jid, s)
@@ -471,10 +485,10 @@ def _show_search_jobs(tracker: dict, search_name: str, jrun_dir: Path, status_fi
     jobs = {}
     for jid in search["job_ids"]:
         if jid in tracker["jobs"]:
-            if not jid.startswith("pending-"):
-                output = airsctl.job_list(jid)
-                if output:
-                    s = _parse_job_status(output)
+            if not jid.startswith("queued-"):
+                result = airsctl.job_list(jid)
+                if result.returncode == 0 and result.stdout:
+                    s = _parse_job_status(result.stdout)
                     if s:
                         tracker["jobs"][jid]["status"] = s
                         update_job_status(jrun_dir, jid, s)
@@ -494,12 +508,16 @@ def _show_search_jobs(tracker: dict, search_name: str, jrun_dir: Path, status_fi
 
 
 def _show_single_job(job_id: str, tracker: dict, jrun_dir):
-    output = airsctl.job_list(job_id)
-    if not output:
-        click.echo(f"No info found for job {job_id}")
+    result = airsctl.job_list(job_id)
+    if result.returncode != 0 or not result.stdout:
+        if job_id in tracker.get("jobs", {}):
+            settings, _ = load_settings()
+            _print_job_table({job_id: tracker["jobs"][job_id]}, settings)
+        else:
+            click.echo(f"No info found for job {job_id}")
         return
 
-    status = _parse_job_status(output)
+    status = _parse_job_status(result.stdout)
     if status and job_id in tracker.get("jobs", {}):
         tracker["jobs"][job_id]["status"] = status
         update_job_status(jrun_dir, job_id, status)
@@ -529,6 +547,7 @@ STATUS_COLORS = {
     "stopped": "magenta",
     "cancelled": "magenta",
     "pending": "bright_black",
+    "queued": "bright_black",
 }
 
 
@@ -586,11 +605,32 @@ def _parse_job_status(output: str) -> str | None:
 
 
 @cli.command()
-@click.argument("name_or_id")
-def stop(name_or_id):
-    """Stop a running job or search scheduler by name or ID."""
+@click.argument("name_or_id", required=False)
+@click.option("--status", "-s", multiple=True, help="Only stop jobs with this status (can be repeated)")
+def stop(name_or_id, status):
+    """Stop a running job or search scheduler by name or ID, or stop jobs by status."""
     settings, jrun_dir = load_settings()
     tracker = load_tracker(jrun_dir)
+    status_filter = set(status) if status else None
+
+    if not name_or_id:
+        if not status_filter:
+            click.echo("Error: must provide either a job/search name or --status filter.", err=True)
+            raise SystemExit(1)
+
+        all_jobs = tracker.get("jobs", {})
+        stopped_count = 0
+        for jid, job_info in all_jobs.items():
+            if job_info.get("status") in status_filter:
+                if jid.startswith("queued-") or job_info.get("status") == "Pending":
+                    update_job_status(jrun_dir, jid, "Stopped")
+                else:
+                    _log_airsctl_error(airsctl.job_stop(jid), "job stop")
+                stopped_count += 1
+                click.echo(f"Stopped {job_info['name']} (status={job_info.get('status')})")
+
+        click.echo(f"Stopped {stopped_count} jobs matching status {list(status_filter)}.")
+        return
 
     # Check if it's a search name — stop scheduler + all active jobs
     if name_or_id in tracker.get("searches", {}):
@@ -599,20 +639,31 @@ def stop(name_or_id):
             click.echo(f"Stopped scheduler for '{name_or_id}'")
 
         search = tracker["searches"][name_or_id]
+        stopped_count = 0
         for jid in search.get("job_ids", []):
             job_info = tracker["jobs"].get(jid, {})
-            if jid.startswith("pending-"):
+            if status_filter and job_info.get("status") not in status_filter:
+                continue
+            if jid.startswith("queued-") or job_info.get("status") == "Pending":
                 update_job_status(jrun_dir, jid, "Stopped")
             else:
                 _log_airsctl_error(airsctl.job_stop(jid), "job stop")
-        click.echo(f"Stopped all jobs in search '{name_or_id}'")
+            stopped_count += 1
+
+        if status_filter:
+            click.echo(f"Stopped {stopped_count} jobs in search '{name_or_id}' matching status {list(status_filter)}.")
+        else:
+            click.echo(f"Stopped all jobs in search '{name_or_id}'")
         return
 
     # Single job
     result = find_job_by_name(jrun_dir, name_or_id)
     if result:
         job_id, job_info = result
-        if job_id.startswith("pending-"):
+        if status_filter and job_info.get("status") not in status_filter:
+            click.echo(f"Skipped '{name_or_id}' (status={job_info.get('status')} not in {list(status_filter)})")
+            return
+        if job_id.startswith("queued-"):
             update_job_status(jrun_dir, job_id, "Stopped")
             click.echo(f"Cancelled pending job '{name_or_id}'")
             return
@@ -622,12 +673,41 @@ def stop(name_or_id):
 
 
 @cli.command()
-@click.argument("name_or_id")
-def remove(name_or_id):
+@click.argument("name_or_id", required=False)
+@click.option("--status", "-s", multiple=True, help="Only remove jobs with this status (can be repeated)")
+def remove(name_or_id, status):
     """Remove a job or search: delete config from experiment, cancel on platform, and remove from tracker."""
     settings, jrun_dir = load_settings()
     exp_id = settings.get("experiment_id")
     tracker = load_tracker(jrun_dir)
+    status_filter = set(status) if status else None
+
+    if not name_or_id:
+        if not status_filter:
+            click.echo("Error: must provide either a job/search name or --status filter.", err=True)
+            raise SystemExit(1)
+
+        all_jobs = dict(tracker.get("jobs", {}))
+        config_names = set()
+        removed_count = 0
+        for jid, job_info in all_jobs.items():
+            if job_info.get("status") in status_filter:
+                job_name = job_info.get("name", jid)
+                if jid.startswith("queued-"):
+                    remove_job(jrun_dir, jid)
+                else:
+                    _log_airsctl_error(airsctl.job_cancel(jid), "job cancel")
+                    if job_name:
+                        config_names.add(job_name)
+                    remove_job(jrun_dir, jid)
+                removed_count += 1
+                click.echo(f"Removed {job_name} (status={job_info.get('status')})")
+
+        if exp_id and config_names:
+            _remove_configs_from_experiment(exp_id, config_names)
+
+        click.echo(f"Removed {removed_count} jobs matching status {list(status_filter)}.")
+        return
 
     if name_or_id in tracker.get("searches", {}):
         # Stop scheduler daemon first
@@ -635,14 +715,47 @@ def remove(name_or_id):
 
         search = tracker["searches"][name_or_id]
         job_ids = search.get("job_ids", [])
-        click.echo(f"Removing search '{name_or_id}' ({len(job_ids)} jobs)")
-        for jid in job_ids:
-            job_info = tracker["jobs"].get(jid, {})
-            if jid.startswith("pending-"):
-                continue
-            _remove_one_job(jid, job_info.get("name"), exp_id)
-        remove_search(jrun_dir, name_or_id)
-        click.echo(f"Search '{name_or_id}' removed.")
+
+        if status_filter:
+            # Only remove jobs matching status filter
+            config_names = set()
+            removed_count = 0
+            for jid in job_ids:
+                job_info = tracker["jobs"].get(jid, {})
+                if job_info.get("status") not in status_filter:
+                    continue
+                job_name = job_info.get("name", jid)
+                if jid.startswith("queued-"):
+                    remove_job(jrun_dir, jid)
+                else:
+                    _log_airsctl_error(airsctl.job_cancel(jid), "job cancel")
+                    if job_name:
+                        config_names.add(job_name)
+                    remove_job(jrun_dir, jid)
+                removed_count += 1
+
+            if exp_id and config_names:
+                _remove_configs_from_experiment(exp_id, config_names)
+
+            click.echo(f"Removed {removed_count} jobs in search '{name_or_id}' matching status {list(status_filter)}.")
+        else:
+            click.echo(f"Removing search '{name_or_id}' ({len(job_ids)} jobs)")
+
+            config_names = set()
+            for jid in job_ids:
+                job_info = tracker["jobs"].get(jid, {})
+                if jid.startswith("queued-"):
+                    continue
+                _log_airsctl_error(airsctl.job_cancel(jid), "job cancel")
+                name = job_info.get("name")
+                if name:
+                    config_names.add(name)
+
+            if exp_id and config_names:
+                _remove_configs_from_experiment(exp_id, config_names)
+
+            remove_search(jrun_dir, name_or_id)
+            click.echo(f"Search '{name_or_id}' removed.")
     else:
         result = find_job_by_name(jrun_dir, name_or_id)
         if result:
@@ -651,10 +764,14 @@ def remove(name_or_id):
             job_id = name_or_id
             job_info = tracker.get("jobs", {}).get(job_id, {})
 
+        if status_filter and job_info.get("status") not in status_filter:
+            click.echo(f"Skipped '{name_or_id}' (status={job_info.get('status')} not in {list(status_filter)})")
+            return
+
         job_name = job_info.get("name", name_or_id)
-        if job_id.startswith("pending-"):
+        if job_id.startswith("queued-"):
             remove_job(jrun_dir, job_id)
-            click.echo(f"Pending job '{job_name}' removed.")
+            click.echo(f"Queued job '{job_name}' removed.")
         else:
             _remove_one_job(job_id, job_name, exp_id)
             remove_job(jrun_dir, job_id)
@@ -665,7 +782,35 @@ def _remove_one_job(job_id: str, config_name: str | None, exp_id: str | None):
     """Remove config from experiment and cancel job on platform."""
     if exp_id and config_name:
         _remove_config_from_experiment(exp_id, config_name)
-    _log_airsctl_error(airsctl.job_cancel(job_id), "job cancel")
+    if not job_id.startswith("queued-"):
+        _log_airsctl_error(airsctl.job_cancel(job_id), "job cancel")
+
+
+def _remove_configs_from_experiment(exp_id: str, config_names: set[str]):
+    """Batch remove multiple configs from experiment in one modify call."""
+    output = airsctl.experiment_list(exp_id=exp_id)
+    if not output:
+        return
+    try:
+        config_data = json.loads(output)
+    except json.JSONDecodeError:
+        return
+
+    advance_configs = config_data.get("advance_config_infos", [])
+    filtered = [c for c in advance_configs if c.get("config_name") not in config_names]
+    if len(filtered) == len(advance_configs):
+        return
+
+    config_data["advance_config_infos"] = filtered
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", prefix="jrun_", delete=False
+    ) as f:
+        json.dump(config_data, f, indent=2)
+        tmp_path = f.name
+    try:
+        _log_airsctl_error(airsctl.experiment_modify(tmp_path), "experiment modify")
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
 
 
 def _remove_config_from_experiment(exp_id: str, config_name: str):

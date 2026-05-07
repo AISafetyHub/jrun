@@ -156,20 +156,20 @@ def update_job_status(jrun_dir: Path, job_id: str, status: str):
 
 
 def record_pending_jobs(jrun_dir: Path, search_name: str, config_file: str, jobs: list[dict]):
-    """Record jobs as Pending in tracker. Each job gets a temporary ID 'pending-<hash>'."""
+    """Record jobs as Queued in tracker. Each job gets a temporary ID 'queued-<hash>'."""
     import hashlib
     with locked_tracker(jrun_dir) as tracker:
         now = datetime.now().isoformat(timespec="seconds")
 
         job_ids = []
         for j in jobs:
-            pending_id = "pending-" + hashlib.md5(j["name"].encode()).hexdigest()[:12]
-            job_ids.append(pending_id)
-            tracker["jobs"][pending_id] = {
+            queued_id = "queued-" + hashlib.md5(j["name"].encode()).hexdigest()[:12]
+            job_ids.append(queued_id)
+            tracker["jobs"][queued_id] = {
                 "name": j["name"],
                 "search_name": search_name,
                 "params": j.get("params", {}),
-                "status": "Pending",
+                "status": "Queued",
                 "submitted_at": now,
                 "job_data": {
                     "name": j["name"],
@@ -195,16 +195,16 @@ def record_pending_jobs(jrun_dir: Path, search_name: str, config_file: str, jobs
     return job_ids
 
 
-def replace_pending_with_real(jrun_dir: Path, pending_id: str, real_job_id: str):
-    """Replace a pending job entry with the real job ID after submission."""
+def replace_pending_with_real(jrun_dir: Path, queued_id: str, real_job_id: str):
+    """Replace a queued job entry with the real job ID after submission."""
     with locked_tracker(jrun_dir) as tracker:
-        if pending_id not in tracker["jobs"]:
+        if queued_id not in tracker["jobs"]:
             return
-        job_info = tracker["jobs"].pop(pending_id)
+        job_info = tracker["jobs"].pop(queued_id)
         job_info["status"] = "Submitted"
         job_info.pop("job_data", None)
         tracker["jobs"][real_job_id] = job_info
 
         for search in tracker["searches"].values():
             ids = search.get("job_ids", [])
-            search["job_ids"] = [real_job_id if jid == pending_id else jid for jid in ids]
+            search["job_ids"] = [real_job_id if jid == queued_id else jid for jid in ids]

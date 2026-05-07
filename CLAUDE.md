@@ -15,9 +15,11 @@ uv sync
 # Run in development mode
 uv run jrun --help
 
-# Install as a tool
-uv tool install .
+# Install as editable tool (already done, no need to reinstall after code changes)
+uv tool install -e .
 ```
+
+**Important:** jrun is installed with `uv tool install -e .` (editable mode). Code changes take effect immediately — do NOT reinstall after modifying source files.
 
 **Important:** Unset `http_proxy` and `https_proxy` environment variables before running jrun, or airsctl subprocess calls will fail.
 
