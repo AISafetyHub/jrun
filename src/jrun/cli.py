@@ -124,8 +124,24 @@ def submit(config_file, dry_run, overwrite, status):
     loader = ConfigLoader(config_file)
     formatter = StatusFormatter(project)
 
-    exp_name = project.experiment_name
-    exp_id = project.experiment_id
+    exp_name = loader.get_experiment_name() or project.experiment_name
+    exp_id = loader.get_experiment_id() or project.experiment_id
+
+    if not dry_run and not exp_id:
+        click.echo("Error: no experiment ID. Set one in the config or run 'jrun init -e <id>'.", err=True)
+        raise SystemExit(1)
+
+    if not dry_run:
+        config_count = platform.count_experiment_configs(exp_id)
+        if config_count is not None and config_count >= 100:
+            click.echo(
+                f"Warning: experiment '{exp_name or exp_id}' already has {config_count} configs. "
+                f"Too many configs may cause platform performance issues.",
+                err=True,
+            )
+            if not click.confirm("Continue?", default=False):
+                click.echo("Aborted.")
+                return
 
     search = loader.config.get("search")
     if search:
@@ -244,9 +260,11 @@ def submit(config_file, dry_run, overwrite, status):
                 except PlatformError as e:
                     click.echo(f"  {j.name}: Error: {e}", err=True)
 
-            project.record_search(search_name, config_file, job_entries)
+            project.record_search(search_name, config_file, job_entries,
+                                   experiment_id=exp_id, experiment_name=exp_name)
             pending_dicts = [j.to_dict() for j in pending]
-            project.record_pending_jobs(search_name, config_file, pending_dicts)
+            project.record_pending_jobs(search_name, config_file, pending_dicts,
+                                        experiment_id=exp_id, experiment_name=exp_name)
 
             scheduler = Scheduler(
                 project.jrun_dir, search_name, exp_name, exp_id,
@@ -266,7 +284,8 @@ def submit(config_file, dry_run, overwrite, status):
                         job_entries.append({"job_id": job_id, "name": j.name, "params": j.params})
                     except PlatformError as e:
                         click.echo(f"\n  {j.name}: Error: {e}", err=True)
-            project.record_search(search_name, config_file, job_entries)
+            project.record_search(search_name, config_file, job_entries,
+                                   experiment_id=exp_id, experiment_name=exp_name)
             click.echo(f"\nSubmitted {len(job_entries)} jobs under search '{search_name}'")
             _show_submitted_jobs(project, formatter, [e["job_id"] for e in job_entries])
 
@@ -329,7 +348,8 @@ def submit(config_file, dry_run, overwrite, status):
         click.echo(f"Submitting {job.name}...")
         try:
             job_id = platform.submit_job(job, exp_name, exp_id)
-            project.record_single_job(job_id, job.name)
+            project.record_single_job(job_id, job.name,
+                                      experiment_id=exp_id, experiment_name=exp_name)
             click.echo(f"Submitted → {job_id[:8]}")
             _show_submitted_jobs(project, formatter, [job_id])
         except PlatformError as e:
@@ -630,7 +650,6 @@ def remove(name_or_id, status):
     project = Project()
     platform = PlatformClient()
     tracker = project.load_tracker()
-    exp_id = project.experiment_id
     status_filter = set(status) if status else None
 
     if name_or_id in tracker.get("searches", {}):
@@ -642,6 +661,7 @@ def remove(name_or_id, status):
 
         search = tracker["searches"][name_or_id]
         job_ids = search.get("job_ids", [])
+        exp_id = search.get("experiment_id") or project.experiment_id
 
         if status_filter:
             config_names = set()
@@ -705,6 +725,7 @@ def remove(name_or_id, status):
             click.echo(f"No job or search matching '{name_or_id}'.", err=True)
             raise SystemExit(1)
 
+        exp_id = job_info.get("experiment_id") or project.experiment_id
         _refresh_active_statuses(project, platform, tracker, job_ids=[job_id])
         job_name = job_info.get("name", job_id)
         click.echo(f"Removing {job_name}...")

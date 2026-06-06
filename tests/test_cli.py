@@ -121,6 +121,7 @@ job:
 """)
 
         mock_client = MagicMock()
+        mock_client.count_experiment_configs.return_value = 0
         mock_client.experiment_modify.return_value = MagicMock(returncode=0)
         mock_client.job_run.return_value = MagicMock(returncode=0, stdout="Job abc-456 submitted")
         mock_platform_cls.return_value = mock_client
@@ -159,6 +160,7 @@ job:
 
         mock_client = MagicMock()
         # Platform reports the job has actually succeeded
+        mock_client.count_experiment_configs.return_value = 0
         mock_client.get_job_status.return_value = "Succeed"
         mock_platform_cls.return_value = mock_client
 
@@ -348,3 +350,67 @@ class TestStatus:
         # Only the active job (j3) should trigger a platform call
         assert mock_client.get_job_status.call_count == 1
         mock_client.get_job_status.assert_called_once_with("j3")
+
+
+class TestExperimentIdFromConfig:
+    @patch("jrun.cli.PlatformClient")
+    def test_config_experiment_id_used_over_project_default(self, mock_platform_cls, runner, project_dir, tmp_path, monkeypatch):
+        monkeypatch.chdir(project_dir)
+        config = tmp_path / "job.yaml"
+        config.write_text("""
+job:
+  name: test-job
+  command: echo hello
+  experiment_id: "config-exp-id"
+  experiment_name: "config-exp-name"
+""")
+        mock_client = MagicMock()
+        mock_client.count_experiment_configs.return_value = 5
+        mock_client.submit_job.return_value = "uuid-1234-5678"
+        mock_client.get_job_status.return_value = "Submitted"
+        mock_platform_cls.return_value = mock_client
+
+        result = runner.invoke(cli, ["submit", str(config)])
+        assert result.exit_code == 0
+        mock_client.submit_job.assert_called_once()
+        call_args = mock_client.submit_job.call_args
+        assert call_args[0][1] == "config-exp-name"
+        assert call_args[0][2] == "config-exp-id"
+
+    @patch("jrun.cli.PlatformClient")
+    def test_config_count_warning_aborts(self, mock_platform_cls, runner, project_dir, tmp_path, monkeypatch):
+        monkeypatch.chdir(project_dir)
+        config = tmp_path / "job.yaml"
+        config.write_text("""
+job:
+  name: test-job
+  command: echo hello
+""")
+        mock_client = MagicMock()
+        mock_client.count_experiment_configs.return_value = 150
+        mock_platform_cls.return_value = mock_client
+
+        result = runner.invoke(cli, ["submit", str(config)], input="n\n")
+        assert "Warning" in result.output
+        assert "150" in result.output
+        assert "Aborted" in result.output
+        mock_client.submit_job.assert_not_called()
+
+    @patch("jrun.cli.PlatformClient")
+    def test_config_count_warning_continues(self, mock_platform_cls, runner, project_dir, tmp_path, monkeypatch):
+        monkeypatch.chdir(project_dir)
+        config = tmp_path / "job.yaml"
+        config.write_text("""
+job:
+  name: test-job
+  command: echo hello
+""")
+        mock_client = MagicMock()
+        mock_client.count_experiment_configs.return_value = 100
+        mock_client.submit_job.return_value = "uuid-1234-5678"
+        mock_client.get_job_status.return_value = "Submitted"
+        mock_platform_cls.return_value = mock_client
+
+        result = runner.invoke(cli, ["submit", str(config)], input="y\n")
+        assert "Warning" in result.output
+        mock_client.submit_job.assert_called_once()

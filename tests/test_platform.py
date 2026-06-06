@@ -150,3 +150,31 @@ class TestRetryOnUnauthenticated:
 
         assert mock_run.call_count == 2
         mock_sleep.assert_called_once_with(35)
+
+
+class TestCountExperimentConfigs:
+    @patch("subprocess.run")
+    def test_returns_config_count(self, mock_run):
+        exp_data = {"advance_config_infos": [{"config_name": f"cfg_{i}"} for i in range(5)]}
+        mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(exp_data), stderr="")
+        client = PlatformClient()
+        assert client.count_experiment_configs("exp-123") == 5
+
+    @patch("subprocess.run")
+    def test_returns_zero_for_empty(self, mock_run):
+        exp_data = {"advance_config_infos": []}
+        mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(exp_data), stderr="")
+        client = PlatformClient()
+        assert client.count_experiment_configs("exp-123") == 0
+
+    @patch("subprocess.run")
+    def test_returns_none_on_failure(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error")
+        client = PlatformClient()
+        assert client.count_experiment_configs("exp-123") is None
+
+    @patch("subprocess.run")
+    def test_returns_none_on_invalid_json(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="not json", stderr="")
+        client = PlatformClient()
+        assert client.count_experiment_configs("exp-123") is None

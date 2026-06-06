@@ -98,7 +98,8 @@ class Project:
     def _locked_tracker(self) -> "_LockedTracker":
         return _LockedTracker(self)
 
-    def record_search(self, search_name: str, config_file: str, job_entries: list[dict]):
+    def record_search(self, search_name: str, config_file: str, job_entries: list[dict],
+                       experiment_id: str | None = None, experiment_name: str | None = None):
         with self._locked_tracker() as tracker:
             now = datetime.now().isoformat(timespec="seconds")
             existing_search = tracker["searches"].get(search_name)
@@ -109,30 +110,44 @@ class Project:
                 jid for jid in old_job_ids
                 if jid in tracker.get("jobs", {}) and tracker["jobs"][jid].get("name") not in new_names
             ]
-            tracker["searches"][search_name] = {
+            search_entry = {
                 "config_file": config_file,
                 "submitted_at": now,
                 "job_ids": kept_ids + new_job_ids,
             }
+            if experiment_id:
+                search_entry["experiment_id"] = experiment_id
+            if experiment_name:
+                search_entry["experiment_name"] = experiment_name
+            tracker["searches"][search_name] = search_entry
             for j in job_entries:
-                tracker["jobs"][j["job_id"]] = {
+                job_entry = {
                     "name": j["name"],
                     "search_name": search_name,
                     "params": j.get("params", {}),
                     "status": "Submitted",
                     "submitted_at": now,
                 }
+                if experiment_id:
+                    job_entry["experiment_id"] = experiment_id
+                tracker["jobs"][j["job_id"]] = job_entry
 
-    def record_single_job(self, job_id: str, job_name: str):
+    def record_single_job(self, job_id: str, job_name: str,
+                           experiment_id: str | None = None, experiment_name: str | None = None):
         with self._locked_tracker() as tracker:
             now = datetime.now().isoformat(timespec="seconds")
-            tracker["jobs"][job_id] = {
+            job_entry = {
                 "name": job_name,
                 "search_name": None,
                 "params": {},
                 "status": "Submitted",
                 "submitted_at": now,
             }
+            if experiment_id:
+                job_entry["experiment_id"] = experiment_id
+            if experiment_name:
+                job_entry["experiment_name"] = experiment_name
+            tracker["jobs"][job_id] = job_entry
 
     def find_job_by_name(self, job_name: str) -> tuple[str, dict] | None:
         tracker = self.load_tracker()
@@ -163,7 +178,8 @@ class Project:
             if job_id in tracker["jobs"]:
                 tracker["jobs"][job_id]["status"] = status
 
-    def record_pending_jobs(self, search_name: str, config_file: str, jobs: list) -> list[str]:
+    def record_pending_jobs(self, search_name: str, config_file: str, jobs: list,
+                            experiment_id: str | None = None, experiment_name: str | None = None) -> list[str]:
         with self._locked_tracker() as tracker:
             now = datetime.now().isoformat(timespec="seconds")
             job_ids = []
@@ -171,7 +187,7 @@ class Project:
                 job_dict = j.to_dict() if hasattr(j, "to_dict") else j
                 queued_id = "queued-" + hashlib.md5(job_dict["name"].encode()).hexdigest()[:12]
                 job_ids.append(queued_id)
-                tracker["jobs"][queued_id] = {
+                job_entry = {
                     "name": job_dict["name"],
                     "search_name": search_name,
                     "params": job_dict.get("params", {}),
@@ -179,6 +195,9 @@ class Project:
                     "submitted_at": now,
                     "job_data": job_dict,
                 }
+                if experiment_id:
+                    job_entry["experiment_id"] = experiment_id
+                tracker["jobs"][queued_id] = job_entry
 
             existing_search = tracker["searches"].get(search_name)
             old_job_ids = existing_search["job_ids"] if existing_search else []
@@ -187,11 +206,16 @@ class Project:
                 jid for jid in old_job_ids
                 if jid in tracker.get("jobs", {}) and tracker["jobs"][jid].get("name") not in new_names
             ]
-            tracker["searches"][search_name] = {
+            search_entry = {
                 "config_file": config_file,
                 "submitted_at": now,
                 "job_ids": kept_ids + job_ids,
             }
+            if experiment_id:
+                search_entry["experiment_id"] = experiment_id
+            if experiment_name:
+                search_entry["experiment_name"] = experiment_name
+            tracker["searches"][search_name] = search_entry
         return job_ids
 
     @staticmethod

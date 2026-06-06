@@ -32,7 +32,15 @@ class ConfigLoader:
                 return val
             raise ValueError(f"Undefined variable: ${name}")
 
-        raw = re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", _resolve, raw)
+        # Process variable substitution line by line, skipping comment-only lines
+        lines = raw.split("\n")
+        resolved_lines = []
+        for line in lines:
+            if line.lstrip().startswith("#"):
+                resolved_lines.append(line)
+            else:
+                resolved_lines.append(re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", _resolve, line))
+        raw = "\n".join(resolved_lines)
         raw = raw.replace(placeholder, "$")
 
         return yaml.safe_load(raw)
@@ -112,6 +120,14 @@ class ConfigLoader:
         clean = re.sub(r"\{[^}]+\}", "", name_tmpl)
         clean = re.sub(r"_+", "_", clean).strip("_")
         return clean
+
+    def get_experiment_id(self) -> str | None:
+        section = self.config.get("search") or self.config.get("job") or {}
+        return section.get("experiment_id")
+
+    def get_experiment_name(self) -> str | None:
+        section = self.config.get("search") or self.config.get("job") or {}
+        return section.get("experiment_name")
 
     def get_scheduler_params(self) -> dict:
         search = self.config.get("search", {})

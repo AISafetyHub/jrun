@@ -151,6 +151,10 @@ Two mutually exclusive top-level keys:
 - **`search:`** — Grid search with `job_template` (name, commands, envs, resource_config), `params` (list of name/values), `sampling: grid`, `max_trials`, `parallel_trials` (not yet implemented).
 - **`job:`** — Single job with `name`, `command`/`commands`, `envs`, `resource_config`.
 
+Both `search:` and `job:` support optional `experiment_id` and `experiment_name` fields that override the defaults from `jrun init`. If omitted, the defaults from `.jrun/settings.json` are used.
+
+When submitting, if the target experiment already has ≥100 configs, jrun will warn and ask for confirmation before proceeding.
+
 Special cases:
 - `resource_config.queue_name: local` → runs command locally via `subprocess.run(shell=True)` instead of submitting
 - `resource_config.worker.replicas` → multi-node job with master + worker pods

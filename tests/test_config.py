@@ -96,6 +96,20 @@ job:
         job = loader.build_single_job()
         assert job.command == "echo $HOME"
 
+    def test_comments_with_undefined_vars_ignored(self, write_config, monkeypatch):
+        monkeypatch.delenv("SHARED_OUTPUT_DIR", raising=False)
+        cfg = write_config("""
+# This is a comment with $SHARED_OUTPUT_DIR reference
+# Another comment: $UNDEFINED_VAR should be ignored
+job:
+  name: test
+  command: echo hello
+  # Inline comment with $ANOTHER_UNDEFINED_VAR
+""")
+        loader = ConfigLoader(cfg)
+        job = loader.build_single_job()
+        assert job.command == "echo hello"
+
 
 class TestGridExpansion:
     def test_single_param(self, write_config):
@@ -303,3 +317,43 @@ search:
         assert len(jobs[0].name) == len("job-") + 6
         # Different params produce different hashes
         assert jobs[0].name != jobs[1].name
+
+
+class TestExperimentId:
+    def test_search_experiment_id(self, write_config):
+        cfg = write_config("""
+search:
+  experiment_id: "custom-exp-id-123"
+  experiment_name: "custom-exp"
+  job_template:
+    name: job-{x}
+    command: echo {x}
+  params:
+    - name: x
+      values: [1]
+""")
+        loader = ConfigLoader(cfg)
+        assert loader.get_experiment_id() == "custom-exp-id-123"
+        assert loader.get_experiment_name() == "custom-exp"
+
+    def test_job_experiment_id(self, write_config):
+        cfg = write_config("""
+job:
+  name: my-job
+  command: echo hello
+  experiment_id: "job-exp-id-456"
+  experiment_name: "job-exp"
+""")
+        loader = ConfigLoader(cfg)
+        assert loader.get_experiment_id() == "job-exp-id-456"
+        assert loader.get_experiment_name() == "job-exp"
+
+    def test_no_experiment_id(self, write_config):
+        cfg = write_config("""
+job:
+  name: my-job
+  command: echo hello
+""")
+        loader = ConfigLoader(cfg)
+        assert loader.get_experiment_id() is None
+        assert loader.get_experiment_name() is None

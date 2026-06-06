@@ -140,3 +140,40 @@ class TestExtractPlatformIds:
     def test_no_storage(self):
         assert Project.extract_platform_ids({}) is None
         assert Project.extract_platform_ids({"storage_info": []}) is None
+
+
+class TestTrackerExperimentId:
+    def test_record_search_stores_experiment_id(self, tmp_path):
+        p = Project.init("exp", experiment_id="default-eid", directory=tmp_path)
+        entries = [{"job_id": "j1", "name": "job1", "params": {}}]
+        p.record_search("s1", "config.yaml", entries,
+                        experiment_id="custom-eid", experiment_name="custom-exp")
+        tracker = p.load_tracker()
+        assert tracker["searches"]["s1"]["experiment_id"] == "custom-eid"
+        assert tracker["searches"]["s1"]["experiment_name"] == "custom-exp"
+        assert tracker["jobs"]["j1"]["experiment_id"] == "custom-eid"
+
+    def test_record_search_without_experiment_id(self, tmp_path):
+        p = Project.init("exp", experiment_id="default-eid", directory=tmp_path)
+        entries = [{"job_id": "j1", "name": "job1", "params": {}}]
+        p.record_search("s1", "config.yaml", entries)
+        tracker = p.load_tracker()
+        assert "experiment_id" not in tracker["searches"]["s1"]
+        assert "experiment_id" not in tracker["jobs"]["j1"]
+
+    def test_record_single_job_stores_experiment_id(self, tmp_path):
+        p = Project.init("exp", experiment_id="default-eid", directory=tmp_path)
+        p.record_single_job("j1", "job1",
+                            experiment_id="custom-eid", experiment_name="custom-exp")
+        tracker = p.load_tracker()
+        assert tracker["jobs"]["j1"]["experiment_id"] == "custom-eid"
+        assert tracker["jobs"]["j1"]["experiment_name"] == "custom-exp"
+
+    def test_record_pending_jobs_stores_experiment_id(self, tmp_path):
+        p = Project.init("exp", experiment_id="default-eid", directory=tmp_path)
+        jobs = [{"name": "pending1", "command": "echo", "params": {}, "resource_config": {}, "envs": {}}]
+        ids = p.record_pending_jobs("s1", "config.yaml", jobs,
+                                    experiment_id="custom-eid", experiment_name="custom-exp")
+        tracker = p.load_tracker()
+        assert tracker["searches"]["s1"]["experiment_id"] == "custom-eid"
+        assert tracker["jobs"][ids[0]]["experiment_id"] == "custom-eid"

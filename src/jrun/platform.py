@@ -86,6 +86,16 @@ class PlatformClient:
             return None
         return self._parse_job_status(result.stdout)
 
+    def count_experiment_configs(self, exp_id: str) -> int | None:
+        result = self._run(["experiment", "list", "-e", exp_id], check=False)
+        if result.returncode != 0 or not result.stdout:
+            return None
+        try:
+            data = json.loads(result.stdout)
+            return len(data.get("advance_config_infos", []))
+        except (json.JSONDecodeError, TypeError):
+            return None
+
     def submit_job(self, job: Job, exp_name: str | None, exp_id: str | None) -> str:
         if not exp_id:
             raise PlatformError("experiment list", 1, stderr="experiment_id is required. Run 'jrun init -e <id>' first.")
