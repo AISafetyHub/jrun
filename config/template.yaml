@@ -22,6 +22,11 @@ search:
   # Auto-derived from job_template.name if omitted.
   name: my_search
 
+  # (optional) Override the experiment to submit to. If omitted, uses
+  # the default from `jrun init`.
+  # experiment_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  # experiment_name: my_other_experiment
+
   job_template:
     # (required) Job name template.
     # Use {param} to reference parameter values.
@@ -97,6 +102,11 @@ search:
 job:
   # (required) Job name.
   name: my_single_job
+
+  # (optional) Override the experiment to submit to. If omitted, uses
+  # the default from `jrun init`.
+  # experiment_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  # experiment_name: my_other_experiment
 
   # (required, use "commands" or "command")
   # List of commands joined with "&&", or a single command string.

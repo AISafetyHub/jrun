@@ -44,6 +44,8 @@ jrun template -f config/my.yaml  # write to file
 description: Evaluate models on multiple datasets
 search:
   name: my_eval
+  # experiment_id: "custom-uuid"    # optional: override jrun init defaults
+  # experiment_name: other_exp      # optional: override jrun init defaults
   job_template:
     name: eval_{model}_{data}_{auto:4s}
     commands:
@@ -75,6 +77,8 @@ search:
 description: Single evaluation job
 job:
   name: eval_llama3_news
+  # experiment_id: "custom-uuid"    # optional: override jrun init defaults
+  # experiment_name: other_exp      # optional: override jrun init defaults
   commands:
     - "python evaluate.py --model llama3_8b --data news"
   envs:
@@ -206,10 +210,14 @@ jrun list
 | `resource_config.shared_mem_gib` | nested | Shared memory in GiB |
 | `resource_config.worker` | nested | Multi-node worker config (`replicas`, resource overrides) |
 | `search.name` | search | Search name (optional, auto-derived) |
+| `search.experiment_id` | search | Override experiment ID from `jrun init` |
+| `search.experiment_name` | search | Override experiment name from `jrun init` |
 | `search.params` | search | List of `{name, values}` for grid expansion |
 | `search.sampling` | search | `grid` |
 | `search.max_trials` | search | Max number of parameter combinations |
 | `search.parallel_trials` | search | Max concurrent jobs (TODO: not yet implemented) |
+| `job.experiment_id` | job | Override experiment ID from `jrun init` |
+| `job.experiment_name` | job | Override experiment name from `jrun init` |
 
 ## Project Structure
 

@@ -2,6 +2,12 @@ description: Grid search test - evaluate models on multiple datasets
 
 search:
   name: test_eval
+
+  # (optional) Override the experiment to submit to.
+  # If omitted, uses the default from `jrun init`.
+  # experiment_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  # experiment_name: my_other_experiment
+
   job_template:
     name: test_eval_{model}_{data}_{auto:4s}
     commands:

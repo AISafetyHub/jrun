@@ -2,6 +2,12 @@ description: Local job test - simple echo task
 
 job:
   name: test_local_echo
+
+  # (optional) Override the experiment to submit to.
+  # If omitted, uses the default from `jrun init`.
+  # experiment_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  # experiment_name: my_other_experiment
+
   command: echo "Hello from jrun local job test"
   resource_config:
     queue_name: local

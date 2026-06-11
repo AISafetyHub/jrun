@@ -44,6 +44,8 @@ jrun template -f config/my.yaml  # 写入文件
 description: 在多个数据集上评估模型
 search:
   name: my_eval
+  # experiment_id: "custom-uuid"    # 可选：覆盖 jrun init 的默认值
+  # experiment_name: other_exp      # 可选：覆盖 jrun init 的默认值
   job_template:
     name: eval_{model}_{data}_{auto:4s}
     commands:
@@ -75,6 +77,8 @@ search:
 description: 单次评估任务
 job:
   name: eval_llama3_news
+  # experiment_id: "custom-uuid"    # 可选：覆盖 jrun init 的默认值
+  # experiment_name: other_exp      # 可选：覆盖 jrun init 的默认值
   commands:
     - python evaluate.py --model llama3_8b --data news
   envs:
@@ -206,10 +210,14 @@ jrun list
 | `resource_config.shared_mem_gib` | 嵌套 | 共享内存 (GiB) |
 | `resource_config.worker` | 嵌套 | 多节点 worker 配置（`replicas`、资源覆盖） |
 | `search.name` | search | 搜索名称（可选，自动推导） |
+| `search.experiment_id` | search | 覆盖 `jrun init` 的实验 ID |
+| `search.experiment_name` | search | 覆盖 `jrun init` 的实验名称 |
 | `search.params` | search | `{name, values}` 列表，用于网格展开 |
 | `search.sampling` | search | `grid` |
 | `search.max_trials` | search | 最大参数组合数 |
 | `search.parallel_trials` | search | 最大并发任务数（TODO: 尚未实现） |
+| `job.experiment_id` | job | 覆盖 `jrun init` 的实验 ID |
+| `job.experiment_name` | job | 覆盖 `jrun init` 的实验名称 |
 
 ## 目录结构
 

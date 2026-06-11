@@ -2,6 +2,12 @@ description: Single job test - simple echo task
 
 job:
   name: test_single_echo
+
+  # (optional) Override the experiment to submit to.
+  # If omitted, uses the default from `jrun init`.
+  # experiment_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  # experiment_name: my_other_experiment
+
   commands:
     - echo "Hello from jrun single job test"
   envs:

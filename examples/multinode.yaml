@@ -2,6 +2,12 @@ description: Multi-node job test - 1 master + 2 workers with env vars
 
 job:
   name: test_multinode
+
+  # (optional) Override the experiment to submit to.
+  # If omitted, uses the default from `jrun init`.
+  # experiment_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  # experiment_name: my_other_experiment
+
   commands:
     - cd /workspace
     - torchrun --nproc_per_node=1 --nnodes=3 train.py
