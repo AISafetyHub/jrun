@@ -3,6 +3,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from jrun.errors import PlatformError
+from jrun.models import Job
 from jrun.platform import PlatformClient
 
 
@@ -83,6 +84,26 @@ class TestPlatformClientCommands:
         )
 
     @patch("subprocess.run")
+    def test_job_run_with_exp_name_only(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="")
+        client = PlatformClient()
+        client.job_run(exp_name="my-exp", config_name="cfg")
+        mock_run.assert_called_once_with(
+            ["airsctl", "job", "run", "-N", "my-exp", "-n", "cfg"],
+            capture_output=True, text=True,
+        )
+
+    @patch("subprocess.run")
+    def test_job_run_prefers_exp_id_over_name(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="")
+        client = PlatformClient()
+        client.job_run(exp_name="stale-exp", exp_id="eid", config_name="cfg")
+        mock_run.assert_called_once_with(
+            ["airsctl", "job", "run", "-e", "eid", "-n", "cfg"],
+            capture_output=True, text=True,
+        )
+
+    @patch("subprocess.run")
     def test_get_job_status_success(self, mock_run):
         mock_run.return_value = MagicMock(
             returncode=0, stdout=json.dumps({"status": "running"})
@@ -115,6 +136,42 @@ class TestPlatformClientCommands:
         mock_run.return_value = MagicMock(returncode=0, stdout="no job data")
         info = PlatformClient().get_job_info("j1")
         assert info is None
+
+    @patch.object(PlatformClient, "job_run")
+    @patch.object(PlatformClient, "experiment_modify")
+    @patch.object(PlatformClient, "experiment_list")
+    def test_submit_uses_experiment_id_for_run(
+        self, mock_list, mock_modify, mock_job_run
+    ):
+        experiment = {
+            "advance_config_infos": [
+                {
+                    "config_name": "base",
+                    "command": "echo old",
+                    "conf_id": "conf-id",
+                    "resource_config_list": [],
+                }
+            ]
+        }
+        job_id = "11111111-1111-1111-1111-111111111111"
+        mock_list.return_value = MagicMock(
+            returncode=0, stdout=json.dumps(experiment), stderr=""
+        )
+        mock_job_run.return_value = MagicMock(
+            returncode=0, stdout=f"Job {job_id} submitted", stderr=""
+        )
+
+        result = PlatformClient().submit_job(
+            Job(name="target", command="echo new"),
+            exp_name="stale-exp",
+            exp_id="eid",
+        )
+
+        assert result == job_id
+        mock_modify.assert_called_once()
+        mock_job_run.assert_called_once_with(
+            exp_id="eid", config_name="target"
+        )
 
 
 class TestRetryOnUnauthenticated:

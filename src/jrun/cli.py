@@ -69,6 +69,15 @@ def init(experiment_name, experiment_id):
             if result.stdout:
                 try:
                     exp_data = json.loads(result.stdout)
+                    canonical_name = exp_data.get("experiment_name")
+                    if canonical_name and canonical_name != experiment_name:
+                        click.echo(
+                            f"Warning: experiment ID {experiment_id} belongs to "
+                            f"'{canonical_name}', not '{experiment_name}'. "
+                            f"Using '{canonical_name}'.",
+                            err=True,
+                        )
+                        experiment_name = canonical_name
                     platform = extract_platform_ids(exp_data)
                 except json.JSONDecodeError:
                     pass

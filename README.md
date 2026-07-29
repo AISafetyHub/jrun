@@ -29,6 +29,8 @@ jrun init -N <experiment-name> -e <experiment-id>
 
 Creates `.jrun/settings.json` with experiment info and platform IDs (auto-extracted for status links). All `jrun` commands locate this directory by walking up from the current working directory.
 
+When an experiment ID is available, it is the authoritative submission target. During initialization, jrun resolves the ID and stores the platform's canonical experiment name if it differs from the supplied name.
+
 ### 2. Write a Config
 
 Use `jrun template` to generate a fully annotated config template:

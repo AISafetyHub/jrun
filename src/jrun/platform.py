@@ -64,10 +64,10 @@ class PlatformClient:
         config_id: str | None = None,
     ) -> subprocess.CompletedProcess:
         args = ["job", "run"]
-        if exp_name:
-            args += ["-N", exp_name]
-        elif exp_id:
+        if exp_id:
             args += ["-e", exp_id]
+        elif exp_name:
+            args += ["-N", exp_name]
         if config_name:
             args += ["-n", config_name]
         elif config_id:
@@ -184,7 +184,7 @@ class PlatformClient:
 
         try:
             self.experiment_modify(tmp_path)
-            result = self.job_run(exp_name=exp_name, exp_id=exp_id, config_name=job.name)
+            result = self.job_run(exp_id=exp_id, config_name=job.name)
 
             output = result.stdout
             match = re.search(r"[Jj]ob.*?([0-9a-f-]{36})", output)

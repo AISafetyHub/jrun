@@ -61,6 +61,31 @@ class TestInit:
         result = runner.invoke(cli, ["init", "-N", "my-exp", "-e", "eid-1"])
         assert result.exit_code == 0
 
+    @patch("jrun.cli.PlatformClient")
+    def test_init_uses_canonical_name_for_experiment_id(
+        self, mock_platform_cls, runner, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        mock_client = MagicMock()
+        mock_client.experiment_list.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps({
+                "experiment_id": "eid-1",
+                "experiment_name": "canonical-exp",
+            }),
+            stderr="",
+        )
+        mock_platform_cls.return_value = mock_client
+
+        result = runner.invoke(
+            cli, ["init", "-N", "stale-exp", "-e", "eid-1"]
+        )
+
+        assert result.exit_code == 0
+        settings = json.loads((tmp_path / ".jrun" / "settings.json").read_text())
+        assert settings["experiment_name"] == "canonical-exp"
+        assert "belongs to 'canonical-exp', not 'stale-exp'" in result.output
+
 
 class TestSubmitDryRun:
     def test_dry_run_single_job(self, runner, project_dir, tmp_path, monkeypatch):
