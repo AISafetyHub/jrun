@@ -321,6 +321,15 @@ class TestStatus:
     @patch("jrun.cli.PlatformClient")
     def test_status_skips_refresh_for_terminal_jobs(self, mock_platform_cls, runner, project_dir, monkeypatch):
         monkeypatch.chdir(project_dir)
+        platform = {
+            "projId": "p1",
+            "projsetId": "ps1",
+            "userId": "u1",
+            "projsetName": "baai-safety",
+            "projectName": "baai-safety_research",
+            "clusterName": "dx-calc1",
+            "zoneName": "dx-calc1-zonea",
+        }
         tracker = {
             "searches": {
                 "my-search": {
@@ -332,10 +341,12 @@ class TestStatus:
             "jobs": {
                 "j1": {"name": "done-job", "search_name": "my-search",
                        "params": {}, "status": "Succeed",
-                       "submitted_at": "2024-01-01T00:00:00"},
+                       "submitted_at": "2024-01-01T00:00:00",
+                       "platform": platform},
                 "j2": {"name": "failed-job", "search_name": "my-search",
                        "params": {}, "status": "Failed",
-                       "submitted_at": "2024-01-01T00:01:00"},
+                       "submitted_at": "2024-01-01T00:01:00",
+                       "platform": platform},
                 "j3": {"name": "active-job", "search_name": "my-search",
                        "params": {}, "status": "Running",
                        "submitted_at": "2024-01-01T00:02:00"},
@@ -343,13 +354,58 @@ class TestStatus:
         }
         (project_dir / ".jrun" / "jobs.json").write_text(json.dumps(tracker))
         mock_client = MagicMock()
-        mock_client.get_job_status.return_value = "Running"
+        mock_client.get_job_info.return_value = {"status": "Running"}
         mock_platform_cls.return_value = mock_client
         result = runner.invoke(cli, ["status"])
         assert result.exit_code == 0
         # Only the active job (j3) should trigger a platform call
-        assert mock_client.get_job_status.call_count == 1
-        mock_client.get_job_status.assert_called_once_with("j3")
+        assert mock_client.get_job_info.call_count == 1
+        mock_client.get_job_info.assert_called_once_with("j3")
+
+    @patch("jrun.cli.PlatformClient")
+    def test_status_backfills_terminal_job_platform(self, mock_platform_cls, runner, project_dir, monkeypatch):
+        monkeypatch.chdir(project_dir)
+        tracker = {
+            "searches": {},
+            "jobs": {
+                "j1": {
+                    "name": "done-job",
+                    "search_name": None,
+                    "params": {},
+                    "status": "Succeed",
+                    "submitted_at": "2026-07-29T14:25:56",
+                    "experiment_name": "test",
+                }
+            },
+        }
+        (project_dir / ".jrun" / "jobs.json").write_text(json.dumps(tracker))
+        mock_client = MagicMock()
+        mock_client.get_job_info.return_value = {
+            "status": "Succeed",
+            "projset_id": "ps1",
+            "proj_id": "p1",
+            "creator_id": 319832320808853520,
+            "projset_name": "baai-safety",
+            "proj_name": "baai-safety_research",
+            "cluster_name": "dx-calc1",
+            "zone_name": "dx-calc1-zonea",
+        }
+        mock_platform_cls.return_value = mock_client
+        result = runner.invoke(cli, ["status"])
+        assert result.exit_code == 0
+        stored = json.loads((project_dir / ".jrun" / "jobs.json").read_text())
+        context = stored["jobs"]["j1"]["platform"]
+        assert stored["jobs"]["j1"]["status"] == "Succeed"
+        assert context == {
+            "projsetId": "ps1",
+            "projId": "p1",
+            "userId": "319832320808853520",
+            "projsetName": "baai-safety",
+            "projectName": "baai-safety_research",
+            "clusterName": "dx-calc1",
+            "zoneName": "dx-calc1-zonea",
+        }
+        assert "platform-multi.baai.ac.cn" in result.output
 
 
 class TestExperimentIdFromConfig:
@@ -376,6 +432,38 @@ job:
         call_args = mock_client.submit_job.call_args
         assert call_args[0][1] == "config-exp-name"
         assert call_args[0][2] == "config-exp-id"
+
+    @patch("jrun.cli.PlatformClient")
+    def test_submit_persists_job_platform(self, mock_platform_cls, runner, project_dir, tmp_path, monkeypatch):
+        monkeypatch.chdir(project_dir)
+        config = tmp_path / "job.yaml"
+        config.write_text("""
+job:
+  name: test-job
+  command: echo hello
+""")
+        mock_client = MagicMock()
+        mock_client.count_experiment_configs.return_value = 0
+        mock_client.submit_job.return_value = "uuid-1234-5678"
+        mock_client.get_job_info.return_value = {
+            "status": "Succeed",
+            "projset_id": "ps1",
+            "proj_id": "p1",
+            "creator_id": 319832320808853520,
+            "projset_name": "baai-safety",
+            "proj_name": "baai-safety_research",
+            "cluster_name": "dx-calc1",
+            "zone_name": "dx-calc1-zonea",
+        }
+        mock_platform_cls.return_value = mock_client
+        result = runner.invoke(cli, ["submit", str(config)])
+        assert result.exit_code == 0
+        stored = json.loads((project_dir / ".jrun" / "jobs.json").read_text())
+        job = stored["jobs"]["uuid-1234-5678"]
+        assert job["status"] == "Succeed"
+        assert job["platform"]["clusterName"] == "dx-calc1"
+        assert job["platform"]["projectName"] == "baai-safety_research"
+        assert "platform-multi.baai.ac.cn" in result.output
 
     @patch("jrun.cli.PlatformClient")
     def test_config_count_warning_aborts(self, mock_platform_cls, runner, project_dir, tmp_path, monkeypatch):

@@ -4,6 +4,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+from jrun.project import Project
 from jrun.scheduler import Scheduler, TERMINAL_STATUSES, ACTIVE_STATUSES
 
 
@@ -82,3 +83,45 @@ class TestConstants:
         assert "Running" in ACTIVE_STATUSES
         assert "Submitted" in ACTIVE_STATUSES
         assert "Queued" in ACTIVE_STATUSES
+
+
+class TestSchedulerSync:
+    def test_run_loop_persists_job_platform(self, tmp_path):
+        project = Project.init("exp", experiment_id="eid-1", directory=tmp_path)
+        entries = [
+            {"job_id": "j1", "name": "job-1", "params": {}},
+        ]
+        project.record_search(
+            "test-search", "search.yaml", entries,
+            experiment_id="eid-1", experiment_name="exp",
+        )
+        project.update_job_status("j1", "Running")
+        scheduler = Scheduler(
+            jrun_dir=project.jrun_dir,
+            search_name="test-search",
+            exp_name="exp",
+            exp_id="eid-1",
+            parallel_trials=1,
+            poll_interval=0,
+        )
+        scheduler.platform = MagicMock()
+        scheduler.platform.get_job_info.return_value = {
+            "status": "Succeed",
+            "projset_id": "ps1",
+            "proj_id": "p1",
+            "creator_id": 319832320808853520,
+            "projset_name": "baai-safety",
+            "proj_name": "baai-safety_research",
+            "cluster_name": "dx-calc1",
+            "zone_name": "dx-calc1-zonea",
+        }
+        scheduler._log = MagicMock()
+        scheduler.run_loop()
+
+        tracker = project.load_tracker()
+        job = tracker["jobs"]["j1"]
+        assert job["status"] == "Succeed"
+        assert job["platform"]["clusterName"] == "dx-calc1"
+        assert job["platform"]["zoneName"] == "dx-calc1-zonea"
+        assert job["experiment_id"] == "eid-1"
+        scheduler.platform.get_job_info.assert_called_once_with("j1")

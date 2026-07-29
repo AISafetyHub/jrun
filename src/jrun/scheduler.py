@@ -133,11 +133,12 @@ class Scheduler:
                     continue
 
                 if not jid.startswith("queued-"):
-                    new_status = self.platform.get_job_status(jid)
-                    if new_status and new_status != status:
-                        self._log(f"Job {job_info['name']} ({jid[:8]}): {status} -> {new_status}")
-                        project.update_job_status(jid, new_status)
-                        status = new_status
+                    platform_info = self.platform.get_job_info(jid)
+                    if isinstance(platform_info, dict):
+                        new_status = project.sync_job_info(jid, job_info, platform_info)
+                        if new_status and new_status != status:
+                            self._log(f"Job {job_info['name']} ({jid[:8]}): {status} -> {new_status}")
+                        status = new_status or status
 
                 if status in ACTIVE_STATUSES:
                     active_count += 1
@@ -187,6 +188,8 @@ class Scheduler:
                             "params": job_params,
                             "status": "Submitted",
                             "submitted_at": datetime.now().isoformat(timespec="seconds"),
+                            "experiment_id": self.exp_id,
+                            "experiment_name": self.exp_name,
                         }
                         tr["jobs"].pop(queued_id, None)
                         search_data = tr["searches"].get(self.search_name)

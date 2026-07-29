@@ -10,7 +10,7 @@ from urllib.parse import urlencode
 JRUN_DIR = ".jrun"
 SETTINGS_FILE = "settings.json"
 TRACKER_FILE = "jobs.json"
-PLATFORM_BASE_URL = "https://platform.baai.ac.cn/platform/modelTraining/jobList/jobDetail"
+PLATFORM_BASE_URL = "https://platform-multi.baai.ac.cn/platform/modelTraining/jobList/jobDetail"
 
 
 class Project:
@@ -51,23 +51,34 @@ class Project:
     def platform_ids(self) -> dict | None:
         return self.settings.get("platform")
 
-    def build_job_url(self, job_id: str) -> str | None:
-        platform = self.platform_ids
+    def build_job_url(self, job_id: str, platform: dict | None = None,
+                      experiment_name: str | None = None) -> str | None:
+        project_platform = self.platform_ids or {}
+        platform = {**project_platform, **(platform or {})}
         if not platform:
+            return None
+        required = ("projId", "projsetId", "userId")
+        if not all(platform.get(key) for key in required):
             return None
         params = {
             "id": job_id,
-            "name": self.experiment_name,
+            "name": experiment_name or self.experiment_name,
             "projId": platform["projId"],
             "projsetId": platform["projsetId"],
             "userId": platform["userId"],
         }
+        if platform.get("clusterName"):
+            params = {"clusterName": platform["clusterName"], **params}
         url = f"{PLATFORM_BASE_URL}?{urlencode(params)}"
         fragment_parts = {}
         if platform.get("projsetName"):
             fragment_parts["projsetName"] = platform["projsetName"]
         if platform.get("projectName"):
             fragment_parts["projectName"] = platform["projectName"]
+        if platform.get("clusterName"):
+            fragment_parts["clusterName"] = platform["clusterName"]
+        if platform.get("zoneName"):
+            fragment_parts["zoneName"] = platform["zoneName"]
         if fragment_parts:
             url += f"#{urlencode(fragment_parts)}"
         return url
@@ -173,10 +184,25 @@ class Project:
                 tracker["jobs"].pop(jid, None)
         return job_ids
 
-    def update_job_status(self, job_id: str, status: str):
+    def update_job_status(self, job_id: str, status: str | None,
+                          platform: dict | None = None):
         with self._locked_tracker() as tracker:
             if job_id in tracker["jobs"]:
-                tracker["jobs"][job_id]["status"] = status
+                if status:
+                    tracker["jobs"][job_id]["status"] = status
+                if platform:
+                    tracker["jobs"][job_id]["platform"] = platform
+
+    def sync_job_info(self, job_id: str, tracked_info: dict, job_info: dict) -> str | None:
+        status = job_info.get("status")
+        platform = self.extract_platform_ids(job_info)
+        if status:
+            tracked_info["status"] = status
+        if platform:
+            tracked_info["platform"] = platform
+        if status or platform:
+            self.update_job_status(job_id, status, platform)
+        return status
 
     def record_pending_jobs(self, search_name: str, config_file: str, jobs: list,
                             experiment_id: str | None = None, experiment_name: str | None = None) -> list[str]:
@@ -220,24 +246,44 @@ class Project:
 
     @staticmethod
     def extract_platform_ids(experiment_json: dict) -> dict | None:
+        projset_id = experiment_json.get("projset_id") or experiment_json.get("projsetId")
+        proj_id = experiment_json.get("proj_id") or experiment_json.get("projId")
+        user_id = experiment_json.get("creator_id") or experiment_json.get("user_id")
+
         storage = experiment_json.get("storage_info", [])
-        if not storage:
-            return None
-        entry = storage[0]
-        user_id = entry.get("user_id")
-        volumes_path = entry.get("volumes_path", "")
-        match = re.search(r"/([0-9a-f-]{36})_([0-9a-f-]{36})/", volumes_path)
-        if not match or not user_id:
+        if user_id is None:
+            for entry in storage:
+                if entry.get("user_id") is not None:
+                    user_id = entry["user_id"]
+                    break
+
+        if not projset_id or not proj_id:
+            for entry in storage:
+                volumes_path = entry.get("volumes_path", "")
+                match = re.search(r"/([0-9a-f-]{36})_([0-9a-f-]{36})/", volumes_path)
+                if match:
+                    projset_id = projset_id or match.group(1)
+                    proj_id = proj_id or match.group(2)
+                    break
+
+        if not projset_id or not proj_id or user_id is None:
             return None
         result = {
-            "projsetId": match.group(1),
-            "projId": match.group(2),
+            "projsetId": str(projset_id),
+            "projId": str(proj_id),
             "userId": str(user_id),
         }
-        if experiment_json.get("projset_name"):
-            result["projsetName"] = experiment_json["projset_name"]
-        if experiment_json.get("project_name"):
-            result["projectName"] = experiment_json["project_name"]
+        optional_fields = {
+            "projsetName": experiment_json.get("projset_name") or experiment_json.get("projsetName"),
+            "projectName": (
+                experiment_json.get("proj_name")
+                or experiment_json.get("project_name")
+                or experiment_json.get("projectName")
+            ),
+            "clusterName": experiment_json.get("cluster_name") or experiment_json.get("clusterName"),
+            "zoneName": experiment_json.get("zone_name") or experiment_json.get("zoneName"),
+        }
+        result.update({key: value for key, value in optional_fields.items() if value})
         return result
 
     @staticmethod

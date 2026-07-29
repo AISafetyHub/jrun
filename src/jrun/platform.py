@@ -81,10 +81,25 @@ class PlatformClient:
         return self._run(["job", "cancel", "-j", job_id])
 
     def get_job_status(self, job_id: str) -> str | None:
+        info = self.get_job_info(job_id)
+        if not info:
+            return None
+        return info.get("status")
+
+    def get_job_info(self, job_id: str) -> dict | None:
         result = self.job_list(job_id, check=False)
         if result.returncode != 0 or not result.stdout:
             return None
-        return self._parse_job_status(result.stdout)
+        status = self._parse_job_status(result.stdout)
+        try:
+            data = json.loads(result.stdout)
+        except (json.JSONDecodeError, TypeError):
+            return {"status": status} if status else None
+        if not isinstance(data, dict):
+            return {"status": status} if status else None
+        if status:
+            data["status"] = status
+        return data
 
     def count_experiment_configs(self, exp_id: str) -> int | None:
         result = self._run(["experiment", "list", "-e", exp_id], check=False)

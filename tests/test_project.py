@@ -1,6 +1,7 @@
 import json
 import pytest
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from jrun.project import Project
 
@@ -59,9 +60,11 @@ class TestProjectTracker:
 
     def test_update_job_status(self, project):
         project.record_single_job("j1", "job")
-        project.update_job_status("j1", "Running")
+        platform = {"clusterName": "dx-calc1", "zoneName": "dx-calc1-zonea"}
+        project.update_job_status("j1", "Running", platform)
         tracker = project.load_tracker()
         assert tracker["jobs"]["j1"]["status"] == "Running"
+        assert tracker["jobs"]["j1"]["platform"] == platform
 
     def test_find_job_by_name(self, project):
         project.record_single_job("j1", "my-job")
@@ -113,11 +116,37 @@ class TestBuildJobUrl:
         assert p.build_job_url("job-id") is None
 
     def test_with_platform(self, tmp_path):
-        platform = {"projId": "p1", "projsetId": "ps1", "userId": "u1"}
-        p = Project.init("exp", experiment_id="e1", platform=platform, directory=tmp_path)
-        url = p.build_job_url("job-id-123")
-        assert "job-id-123" in url
-        assert "projId=p1" in url
+        project_platform = {"projId": "old", "projsetId": "old", "userId": "old"}
+        p = Project.init("exp", experiment_id="e1", platform=project_platform, directory=tmp_path)
+        job_platform = {
+            "projId": "e31a8bd7-5c5e-47d5-a070-4ab934bff3c9",
+            "projsetId": "a7d74c82-9265-41a6-a5c8-9828efde24ae",
+            "userId": "319832320808853520",
+            "projsetName": "baai-safety",
+            "projectName": "baai-safety_research",
+            "clusterName": "dx-calc1",
+            "zoneName": "dx-calc1-zonea",
+        }
+        url = p.build_job_url(
+            "job-id-123", platform=job_platform, experiment_name="test"
+        )
+        parsed = urlparse(url)
+        assert parsed.netloc == "platform-multi.baai.ac.cn"
+        assert parse_qs(parsed.query) == {
+            "clusterName": ["dx-calc1"],
+            "id": ["job-id-123"],
+            "name": ["test"],
+            "projId": ["e31a8bd7-5c5e-47d5-a070-4ab934bff3c9"],
+            "projsetId": ["a7d74c82-9265-41a6-a5c8-9828efde24ae"],
+            "userId": ["319832320808853520"],
+        }
+        assert parse_qs(parsed.fragment) == {
+            "projsetName": ["baai-safety"],
+            "projectName": ["baai-safety_research"],
+            "clusterName": ["dx-calc1"],
+            "zoneName": ["dx-calc1-zonea"],
+        }
+        assert "activeName" not in parse_qs(parsed.fragment)
 
 
 class TestExtractPlatformIds:
@@ -136,6 +165,26 @@ class TestExtractPlatformIds:
         assert result["projId"] == "22222222-2222-2222-2222-222222222222"
         assert result["userId"] == "42"
         assert result["projsetName"] == "MyProjSet"
+
+    def test_new_platform_fields(self):
+        data = {
+            "projset_id": "ps-new",
+            "proj_id": "p-new",
+            "creator_id": 319832320808853520,
+            "projset_name": "baai-safety",
+            "proj_name": "baai-safety_research",
+            "cluster_name": "dx-calc1",
+            "zone_name": "dx-calc1-zonea",
+        }
+        assert Project.extract_platform_ids(data) == {
+            "projsetId": "ps-new",
+            "projId": "p-new",
+            "userId": "319832320808853520",
+            "projsetName": "baai-safety",
+            "projectName": "baai-safety_research",
+            "clusterName": "dx-calc1",
+            "zoneName": "dx-calc1-zonea",
+        }
 
     def test_no_storage(self):
         assert Project.extract_platform_ids({}) is None

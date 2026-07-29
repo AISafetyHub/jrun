@@ -87,6 +87,25 @@ def _run_local(job: Job):
         click.echo(f"  Exit code: {result.returncode}", err=True)
 
 
+def _refresh_job_for_display(project: Project, platform: PlatformClient,
+                             job_id: str, tracked_info: dict):
+    if job_id.startswith("queued-"):
+        return
+    platform_context = tracked_info.get("platform") or {}
+    context_fields = (
+        "projsetId", "projId", "userId", "projsetName", "projectName",
+        "clusterName", "zoneName",
+    )
+    if tracked_info.get("status") in TERMINAL_STATUSES and all(
+        platform_context.get(key) for key in context_fields
+    ):
+        return
+    job_info = platform.get_job_info(job_id)
+    if not isinstance(job_info, dict):
+        return
+    project.sync_job_info(job_id, tracked_info, job_info)
+
+
 def _refresh_active_statuses(project: Project, platform: PlatformClient, tracker: dict,
                               job_ids: list[str] | None = None):
     """Refresh status from platform for non-terminal, non-queued jobs.
@@ -364,11 +383,7 @@ def _show_submitted_jobs(project: Project, formatter: StatusFormatter, job_ids: 
     for jid in job_ids:
         if jid in tracker.get("jobs", {}):
             info = tracker["jobs"][jid]
-            if info.get("status") != "Queued":
-                new_status = platform.get_job_status(jid)
-                if new_status:
-                    info["status"] = new_status
-                    project.update_job_status(jid, new_status)
+            _refresh_job_for_display(project, platform, jid, info)
             jobs[jid] = info
     if jobs:
         click.echo()
@@ -444,11 +459,8 @@ def _show_all_jobs(project: Project, platform: PlatformClient, formatter: Status
                     if job_info.get("status") != "Queued":
                         job_info["status"] = "Queued"
                         project.update_job_status(jid, "Queued")
-                elif job_info.get("status") not in TERMINAL_STATUSES:
-                    new_status = platform.get_job_status(jid)
-                    if new_status:
-                        job_info["status"] = new_status
-                        project.update_job_status(jid, new_status)
+                else:
+                    _refresh_job_for_display(project, platform, jid, job_info)
                 statuses.append(job_info.get("status", "?"))
         if status_filter and not any(s in status_filter for s in statuses):
             continue
@@ -457,9 +469,16 @@ def _show_all_jobs(project: Project, platform: PlatformClient, formatter: Status
         n_jobs = len(job_ids)
         rows.append((f"{sname} ({n_jobs} jobs)", summary, sinfo.get("submitted_at", ""), None, "search"))
 
+    job_urls = {}
     for jid, info in standalone_jobs.items():
+        _refresh_job_for_display(project, platform, jid, info)
         if status_filter and info.get("status") not in status_filter:
             continue
+        job_urls[jid] = project.build_job_url(
+            jid,
+            platform=info.get("platform"),
+            experiment_name=info.get("experiment_name"),
+        )
         rows.append((info["name"], info.get("status", "?"), info.get("submitted_at", ""), jid, "job"))
 
     if not rows:
@@ -470,7 +489,7 @@ def _show_all_jobs(project: Project, platform: PlatformClient, formatter: Status
     if max_jobs > 0 and total > max_jobs:
         rows = rows[:max_jobs]
 
-    has_links = project.platform_ids is not None
+    has_links = any(job_urls.get(row[3]) for row in rows if row[3])
     max_name_len = max(len(r[0]) for r in rows)
     max_status_len = max(len(r[1]) for r in rows)
     name_width = max(max_name_len, 4) + 2
@@ -487,8 +506,8 @@ def _show_all_jobs(project: Project, platform: PlatformClient, formatter: Status
             line = f"{name:<{name_width}} {status_str:<{status_width}} {submitted_at:<20}"
         else:
             line = f"{name:<{name_width}} {formatter.colored_status(status_str, status_width)} {submitted_at:<20}"
-            if has_links and job_id:
-                url = project.build_job_url(job_id)
+            if job_id:
+                url = job_urls.get(job_id)
                 if url:
                     line += f" {formatter.hyperlink(url, 'url')}"
         click.echo(line)
@@ -523,11 +542,8 @@ def _show_search_jobs(project: Project, platform: PlatformClient, formatter: Sta
                 if tracker["jobs"][jid].get("status") != "Queued":
                     tracker["jobs"][jid]["status"] = "Queued"
                     project.update_job_status(jid, "Queued")
-            elif tracker["jobs"][jid].get("status") not in TERMINAL_STATUSES:
-                new_status = platform.get_job_status(jid)
-                if new_status:
-                    tracker["jobs"][jid]["status"] = new_status
-                    project.update_job_status(jid, new_status)
+            else:
+                _refresh_job_for_display(project, platform, jid, tracker["jobs"][jid])
             jobs[jid] = tracker["jobs"][jid]
 
     if status_filter:
@@ -545,16 +561,16 @@ def _show_search_jobs(project: Project, platform: PlatformClient, formatter: Sta
 
 def _show_single_job(project: Project, platform: PlatformClient, formatter: StatusFormatter,
                      job_id: str, tracker: dict):
-    new_status = platform.get_job_status(job_id)
-    if new_status and job_id in tracker.get("jobs", {}):
-        tracker["jobs"][job_id]["status"] = new_status
-        project.update_job_status(job_id, new_status)
+    tracked_info = tracker.get("jobs", {}).get(job_id)
+    if tracked_info:
+        _refresh_job_for_display(project, platform, job_id, tracked_info)
+        formatter.print_job_table({job_id: tracked_info})
+        return
+    job_info = platform.get_job_info(job_id)
+    new_status = job_info.get("status") if isinstance(job_info, dict) else None
 
-    if job_id in tracker.get("jobs", {}):
-        formatter.print_job_table({job_id: tracker["jobs"][job_id]})
-    else:
-        click.echo(f"Job:    {job_id}")
-        click.echo(f"Status: {new_status or '?'}")
+    click.echo(f"Job:    {job_id}")
+    click.echo(f"Status: {new_status or '?'}")
 
 
 @cli.command()

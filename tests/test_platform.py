@@ -96,6 +96,26 @@ class TestPlatformClientCommands:
         client = PlatformClient()
         assert client.get_job_status("j1") is None
 
+    @patch("subprocess.run")
+    def test_get_job_info_json(self, mock_run):
+        payload = {"status": "running", "cluster_name": "dx-calc1"}
+        mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(payload))
+        info = PlatformClient().get_job_info("j1")
+        assert info["status"] == "Running"
+        assert info["cluster_name"] == "dx-calc1"
+
+    @patch("subprocess.run")
+    def test_get_job_info_text_fallback(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="Job j1 is running")
+        info = PlatformClient().get_job_info("j1")
+        assert info == {"status": "Running"}
+
+    @patch("subprocess.run")
+    def test_get_job_info_invalid_output(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="no job data")
+        info = PlatformClient().get_job_info("j1")
+        assert info is None
+
 
 class TestRetryOnUnauthenticated:
     @patch("time.sleep")

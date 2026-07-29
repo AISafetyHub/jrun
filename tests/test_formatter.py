@@ -59,6 +59,27 @@ class TestStatusFormatter:
         assert "job-1" in captured.out
         assert "job-2" in captured.out
 
+    def test_print_job_table_with_job_platform(self, formatter, capsys):
+        jobs = {
+            "j1": {
+                "name": "job-1",
+                "status": "Succeed",
+                "submitted_at": "2026-07-29T14:25:56",
+                "experiment_name": "test",
+                "platform": {
+                    "projId": "p1",
+                    "projsetId": "ps1",
+                    "userId": "u1",
+                    "clusterName": "dx-calc1",
+                    "zoneName": "dx-calc1-zonea",
+                },
+            }
+        }
+        formatter.print_job_table(jobs)
+        output = capsys.readouterr().out
+        assert "platform-multi.baai.ac.cn" in output
+        assert "clusterName=dx-calc1" in output
+
 
 class TestStatusColors:
     def test_all_known_statuses_have_colors(self):

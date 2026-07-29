@@ -41,13 +41,22 @@ class StatusFormatter:
         if not jobs:
             return
 
+        urls = {
+            jid: self.project.build_job_url(
+                jid,
+                platform=info.get("platform"),
+                experiment_name=info.get("experiment_name"),
+            )
+            for jid, info in jobs.items()
+        }
+        has_links = any(urls.values())
         max_name_len = max(len(info['name']) for info in jobs.values())
         max_status_len = max(len(info.get('status', '?')) for info in jobs.values())
         name_width = max(max_name_len, 4) + 2
         status_width = max(max_status_len, 6) + 2
 
         header = f"{'NAME':<{name_width}} {'STATUS':<{status_width}} {'SUBMITTED':<20}"
-        if self.has_links:
+        if has_links:
             header += " LINK"
         click.echo(header)
         click.echo("-" * len(header))
@@ -55,8 +64,7 @@ class StatusFormatter:
         for jid, info in jobs.items():
             status = info.get('status', '?')
             line = f"{info['name']:<{name_width}} {self.colored_status(status, status_width)} {info.get('submitted_at', ''):<20}"
-            if self.has_links:
-                url = self.project.build_job_url(jid)
-                if url:
-                    line += f" {self.hyperlink(url, 'url')}"
+            url = urls[jid]
+            if url:
+                line += f" {self.hyperlink(url, 'url')}"
             click.echo(line)
