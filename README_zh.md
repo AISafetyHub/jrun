@@ -7,10 +7,27 @@
 ## 安装
 
 ```bash
-# 使用 uv 安装（推荐）
-uv tool install .
+# 使用 uv 从 GitHub 直接安装（推荐）
+uv tool install git+https://github.com/AISafetyHub/jrun.git
+```
 
-# 或开发模式安装
+升级到最新版：
+
+```bash
+uv tool upgrade jrun
+```
+
+无需安装，直接运行一次：
+
+```bash
+uvx --from git+https://github.com/AISafetyHub/jrun.git jrun --help
+```
+
+如需参与开发：
+
+```bash
+git clone https://github.com/AISafetyHub/jrun.git
+cd jrun
 uv sync
 uv run jrun --help
 ```

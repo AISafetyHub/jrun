@@ -7,10 +7,27 @@ A CLI tool for submitting and managing jobs on the airsctl platform. Supports gr
 ## Installation
 
 ```bash
-# Install with uv (recommended)
-uv tool install .
+# Install directly from GitHub with uv (recommended)
+uv tool install git+https://github.com/AISafetyHub/jrun.git
+```
 
-# Or install in development mode
+Upgrade to the latest version:
+
+```bash
+uv tool upgrade jrun
+```
+
+Run once without installing:
+
+```bash
+uvx --from git+https://github.com/AISafetyHub/jrun.git jrun --help
+```
+
+For development:
+
+```bash
+git clone https://github.com/AISafetyHub/jrun.git
+cd jrun
 uv sync
 uv run jrun --help
 ```
