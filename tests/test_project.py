@@ -226,3 +226,13 @@ class TestTrackerExperimentId:
         tracker = p.load_tracker()
         assert tracker["searches"]["s1"]["experiment_id"] == "custom-eid"
         assert tracker["jobs"][ids[0]]["experiment_id"] == "custom-eid"
+
+    def test_record_pending_jobs_keeps_replacement_until_scheduler_success(self, project):
+        project.record_single_job("old-id", "pending")
+        ids = project.record_pending_jobs(
+            "s1", "config.yaml", [{"name": "pending", "command": "echo"}],
+            replacement_ids={"pending": "old-id"},
+        )
+        tracker = project.load_tracker()
+        assert tracker["jobs"]["old-id"]["name"] == "pending"
+        assert tracker["jobs"][ids[0]]["replace_job_id"] == "old-id"

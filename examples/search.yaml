@@ -1,15 +1,26 @@
 description: Grid search test - evaluate models on multiple datasets
 
+# Experiment to submit into: jrun looks it up by name and creates it via the
+# platform API if missing (using the job's image/queue for the placeholder
+# config). Requires credentials (`jrun login`, or /etc/accesskey on platform
+# pods). See `jrun queues` for queue options.
+experiment:
+  name: jrun_example_search
+
+
 search:
   name: test_eval
 
-  # (optional) Override the experiment to submit to.
-  # If omitted, uses the default from `jrun init`.
+  # (optional) Submit to an existing experiment by ID/name.
+  # If omitted, uses the experiment: block above or the default from
+  # `.jrun/settings.json`.
   # experiment_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
   # experiment_name: my_other_experiment
 
   job_template:
     name: test_eval_{model}_{data}_{auto:4s}
+    # Docker image the jobs run with (supports {param} substitution).
+    image: harbor.baai.ac.cn/llm-safety-center/enviroments:agents-v1.0.0
     commands:
       - echo "Evaluating model={model} on dataset={data}"
     envs:

@@ -1,10 +1,22 @@
 description: Multi-node job test - 1 master + 2 workers with env vars
 
+# Experiment to submit into: jrun looks it up by name and creates it via the
+# platform API if missing (using the job's image/queue for the placeholder
+# config). Requires credentials (`jrun login`, or /etc/accesskey on platform
+# pods). See `jrun queues` for queue options.
+experiment:
+  name: jrun_example_multinode
+
+
 job:
   name: test_multinode
 
-  # (optional) Override the experiment to submit to.
-  # If omitted, uses the default from `jrun init`.
+  # Docker image the job runs with.
+  image: harbor.baai.ac.cn/llm-safety-center/enviroments:agents-v1.0.0
+
+  # (optional) Submit to an existing experiment by ID/name.
+  # If omitted, uses the experiment: block above or the default from
+  # `.jrun/settings.json`.
   # experiment_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
   # experiment_name: my_other_experiment
 

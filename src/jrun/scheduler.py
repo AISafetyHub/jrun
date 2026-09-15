@@ -23,13 +23,16 @@ ACTIVE_STATUSES = {"Submitted", "Running", "Pending", "Queued", "Starting", "Sch
 
 class Scheduler:
     def __init__(self, jrun_dir: Path, search_name: str, exp_name: str | None,
-                 exp_id: str, parallel_trials: int, poll_interval: int):
+                 exp_id: str, parallel_trials: int, poll_interval: int,
+                 spec: dict | None = None, queue_locations: dict | None = None):
         self.jrun_dir = jrun_dir
         self.search_name = search_name
         self.exp_name = exp_name
         self.exp_id = exp_id
         self.parallel_trials = parallel_trials
         self.poll_interval = poll_interval
+        self.spec = spec
+        self.queue_locations = queue_locations or {}
         self.platform = PlatformClient()
 
     @property
@@ -84,6 +87,8 @@ class Scheduler:
             "exp_id": self.exp_id,
             "parallel_trials": self.parallel_trials,
             "poll_interval": self.poll_interval,
+            "spec": self.spec,
+            "queue_locations": self.queue_locations,
             "pending_jobs": pending_dicts,
         }, indent=2))
 
@@ -165,11 +170,22 @@ class Scheduler:
 
                 self._log(f"Submitting: {job_name}")
 
-                job = Job.from_dict(job_data)
                 real_job_id = None
                 for attempt in range(3):
                     try:
-                        real_job_id = self.platform.submit_job(job, self.exp_name, self.exp_id)
+                        # All pending configs were installed by the submit
+                        # command's one batch modify.  Scheduler turns a
+                        # config into a job only; it must never modify the
+                        # experiment again.
+                        candidate_id = self.platform.run_config(
+                            self.exp_id, job_name
+                        )
+                        if not isinstance(candidate_id, str) or not candidate_id:
+                            raise PlatformError(
+                                "job run", 1,
+                                stderr="platform returned no job ID",
+                            )
+                        real_job_id = candidate_id
                         break
                     except PlatformError as e:
                         self._log(f"  Submit error: {e}")
@@ -192,6 +208,17 @@ class Scheduler:
                             "experiment_name": self.exp_name,
                         }
                         tr["jobs"].pop(queued_id, None)
+                        replacement_id = job_info.get("replace_job_id")
+                        if replacement_id and replacement_id != real_job_id:
+                            # An overwrite replaces only the local name -> ID
+                            # mapping after the new run succeeds.  The old
+                            # platform job is intentionally left untouched.
+                            tr["jobs"].pop(replacement_id, None)
+                            for other_search in tr.get("searches", {}).values():
+                                other_search["job_ids"] = [
+                                    jid for jid in other_search.get("job_ids", [])
+                                    if jid != replacement_id
+                                ]
                         search_data = tr["searches"].get(self.search_name)
                         if search_data:
                             search_data["job_ids"] = [
@@ -257,5 +284,7 @@ if __name__ == "__main__":
         exp_id=args["exp_id"],
         parallel_trials=args["parallel_trials"],
         poll_interval=args["poll_interval"],
+        spec=args.get("spec"),
+        queue_locations=args.get("queue_locations"),
     )
     scheduler.run_loop()

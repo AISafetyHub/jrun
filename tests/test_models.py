@@ -1,5 +1,5 @@
 import pytest
-from jrun.models import Job, ResourceConfig, WorkerConfig
+from jrun.models import ExperimentSpec, Job, ResourceConfig, WorkerConfig
 
 
 class TestWorkerConfig:
@@ -150,3 +150,57 @@ class TestJob:
         }
         j = Job.from_dict(original)
         assert j.to_dict() == original
+
+
+class TestExperimentSpec:
+    def test_from_dict_minimal(self):
+        spec = ExperimentSpec.from_dict({
+            "name": "exp",
+            "image": "img:1",
+            "queue_name": "q1",
+        })
+        assert spec.name == "exp"
+        assert spec.image == "img:1"
+        assert spec.queue_name == "q1"
+        assert spec.image_region == "PUBLIC"
+        assert spec.cluster_id is None
+        assert spec.proj_id is None
+
+    def test_image_region_serialization(self):
+        # Default region is omitted from to_dict; an explicit one is kept.
+        spec = ExperimentSpec(name="e", image="i", queue_name="q")
+        assert "image_region" not in spec.to_dict()
+        spec = ExperimentSpec(name="e", image="i", queue_name="q", image_region="PRIVATE")
+        assert spec.to_dict()["image_region"] == "PRIVATE"
+        assert ExperimentSpec.from_dict(spec.to_dict()).image_region == "PRIVATE"
+
+    def test_image_region_value_mapping(self):
+        # airsctl experiment-modify JSON needs the RepoTypes enum as an int
+        assert ExperimentSpec(name="e", image="i", queue_name="q").image_region_value == 1
+        spec = ExperimentSpec.from_dict({"name": "e", "image": "i", "queue_name": "q",
+                                         "image_region": "private"})  # case-insensitive
+        assert spec.image_region == "PRIVATE"
+        assert spec.image_region_value == 2
+
+    def test_image_region_unknown_raises(self):
+        import pytest
+        with pytest.raises(ValueError, match="unknown image_region"):
+            ExperimentSpec.from_dict({"name": "e", "image": "i", "queue_name": "q",
+                                      "image_region": "INTERNAL"})
+
+    def test_roundtrip(self):
+        original = {
+            "name": "exp",
+            "image": "img:1",
+            "queue_name": "q1",
+            "description": "d",
+            "cluster_id": "c1",
+            "zone_id": "z1",
+            "proj_id": "p1",
+            "projset_id": "ps1",
+        }
+        assert ExperimentSpec.from_dict(original).to_dict() == original
+
+    def test_to_dict_omits_none(self):
+        spec = ExperimentSpec(name="e", image="i", queue_name="q")
+        assert spec.to_dict() == {"name": "e", "image": "i", "queue_name": "q"}

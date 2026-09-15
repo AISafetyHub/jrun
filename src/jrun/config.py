@@ -6,7 +6,8 @@ from pathlib import Path
 
 import yaml
 
-from jrun.models import Job, ResourceConfig
+from jrun.errors import ConfigError
+from jrun.models import ExperimentSpec, Job, ResourceConfig
 
 
 class ConfigLoader:
@@ -93,6 +94,8 @@ class ConfigLoader:
                 params=mapping,
                 resource_config=ResourceConfig.from_dict(template.get("resource_config", {})),
                 envs=envs,
+                image=self._subst_params(template.get("image"), mapping),
+                image_region=self._subst_params(template.get("image_region"), mapping),
             ))
 
         return jobs
@@ -108,6 +111,8 @@ class ConfigLoader:
             params={},
             resource_config=ResourceConfig.from_dict(job.get("resource_config", {})),
             envs=job.get("envs", {}),
+            image=job.get("image"),
+            image_region=job.get("image_region"),
         )
 
     def get_search_name(self) -> str | None:
@@ -125,6 +130,22 @@ class ConfigLoader:
         section = self.config.get("search") or self.config.get("job") or {}
         return section.get("experiment_id")
 
+    def get_experiment_spec(self) -> ExperimentSpec | None:
+        """Parse the top-level `experiment:` block, or None if absent.
+
+        Only `name` is required; image/queue live at job level (the spec's
+        deprecated image/queue_name fields remain as fallbacks).
+        """
+        section = self.config.get("experiment")
+        if not section:
+            return None
+        if not section.get("name"):
+            raise ConfigError("experiment section missing required field: name")
+        try:
+            return ExperimentSpec.from_dict(section)
+        except ValueError as e:
+            raise ConfigError(str(e)) from e
+
     def get_experiment_name(self) -> str | None:
         section = self.config.get("search") or self.config.get("job") or {}
         return section.get("experiment_name")
@@ -135,6 +156,16 @@ class ConfigLoader:
             "parallel_trials": search.get("parallel_trials"),
             "poll_interval": search.get("poll_interval", 30),
         }
+
+    @staticmethod
+    def _subst_params(text, mapping: dict) -> str | None:
+        """{param} substitution for optional scalar fields (image etc.)."""
+        if text is None:
+            return None
+        val = str(text)
+        for k, v in mapping.items():
+            val = val.replace(f"{{{k}}}", str(v))
+        return val
 
     @staticmethod
     def _resolve_auto(name_template: str, params: dict | None = None) -> str:

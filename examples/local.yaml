@@ -3,8 +3,9 @@ description: Local job test - simple echo task
 job:
   name: test_local_echo
 
-  # (optional) Override the experiment to submit to.
-  # If omitted, uses the default from `jrun init`.
+  # (optional) Submit to an existing experiment by ID/name.
+  # If omitted, uses the experiment: block above or the default from
+  # `.jrun/settings.json`.
   # experiment_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
   # experiment_name: my_other_experiment
 

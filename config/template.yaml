@@ -13,12 +13,38 @@
 description: My experiment description
 
 # ==========================================================================
+# Experiment (optional)
+# The experiment to submit into: on the platform it is just a container for
+# configs, so this block only carries its identity. On submit, jrun looks it
+# up by name and creates it via the platform API if missing (using the first
+# job's image/queue for the placeholder config). Requires credentials.
+# On each submit, jrun replaces this experiment's config list with the selected
+# current jobs; the local .jrun/jobs.json file retains job history and IDs.
+# Do not share an experiment unless replacing its configs is intended.
+# ==========================================================================
+# experiment:
+#   # (required) Experiment name.
+#   name: my_experiment
+#
+#   # (optional) Explicit project IDs, skip API resolution when provided.
+#   # proj_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+#   # projset_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+#
+#   # (optional) Explicit cluster/zone, override queue resolution.
+#   # cluster_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+#   # zone_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+#
+#   # DEPRECATED: image/image_region/queue_name used to live here. They still
+#   # work as fallbacks for jobs that don't set them, but prefer the job-level
+#   # fields below (job.image / job.image_region / resource_config.queue_name).
+
+# ==========================================================================
 # Grid Search
 # Expands all parameter combinations (cartesian product) and submits each
 # as a separate job.
 # ==========================================================================
 search:
-  # (optional) Search name for tracking via `jrun status <name>`.
+  # (optional) Search name for tracking via `jrun job status <name>`.
   # Auto-derived from job_template.name if omitted.
   name: my_search
 
@@ -33,6 +59,14 @@ search:
     # Use {auto:Ns} for a deterministic N-char MD5 hash based on params.
     # e.g.: eval_{model}_{data}_{auto:4s}
     name: job_{param1}_{param2}_{auto:4s}
+
+    # (optional) Docker image jobs run with. Overrides the experiment template;
+    # supports {param} substitution. queueId/cluster/zone are resolved via the
+    # platform API from resource_config.queue_name (see `jrun queues`).
+    image: harbor.platform.baai-inner.ac.cn/library/pytorch-sshd:23.08
+
+    # (optional) Image repo type: PUBLIC (default) or PRIVATE.
+    # image_region: PRIVATE
 
     # (required, use "commands" or "command")
     # List of commands joined with "&&", or a single command string.
@@ -102,6 +136,14 @@ search:
 job:
   # (required) Job name.
   name: my_single_job
+
+  # (optional) Docker image the job runs with. Overrides the experiment
+  # template; queueId/cluster/zone are resolved via the platform API from
+  # resource_config.queue_name (see `jrun queues`).
+  image: harbor.platform.baai-inner.ac.cn/library/pytorch-sshd:23.08
+
+  # (optional) Image repo type: PUBLIC (default) or PRIVATE.
+  # image_region: PRIVATE
 
   # (optional) Override the experiment to submit to. If omitted, uses
   # the default from `jrun init`.

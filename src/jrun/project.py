@@ -19,13 +19,15 @@ class Project:
         self.settings = self._load_settings()
 
     @classmethod
-    def init(cls, experiment_name: str, experiment_id: str | None = None,
+    def init(cls, experiment_name: str | None = None, experiment_id: str | None = None,
              platform: dict | None = None, directory: Path | None = None) -> "Project":
         directory = directory or Path.cwd()
         jrun_dir = directory.resolve() / JRUN_DIR
         jrun_dir.mkdir(exist_ok=True)
 
-        data = {"experiment_name": experiment_name}
+        data = {}
+        if experiment_name:
+            data["experiment_name"] = experiment_name
         if experiment_id:
             data["experiment_id"] = experiment_id
         if platform:
@@ -55,33 +57,8 @@ class Project:
                       experiment_name: str | None = None) -> str | None:
         project_platform = self.platform_ids or {}
         platform = {**project_platform, **(platform or {})}
-        if not platform:
-            return None
-        required = ("projId", "projsetId", "userId")
-        if not all(platform.get(key) for key in required):
-            return None
-        params = {
-            "id": job_id,
-            "name": experiment_name or self.experiment_name,
-            "projId": platform["projId"],
-            "projsetId": platform["projsetId"],
-            "userId": platform["userId"],
-        }
-        if platform.get("clusterName"):
-            params = {"clusterName": platform["clusterName"], **params}
-        url = f"{PLATFORM_BASE_URL}?{urlencode(params)}"
-        fragment_parts = {}
-        if platform.get("projsetName"):
-            fragment_parts["projsetName"] = platform["projsetName"]
-        if platform.get("projectName"):
-            fragment_parts["projectName"] = platform["projectName"]
-        if platform.get("clusterName"):
-            fragment_parts["clusterName"] = platform["clusterName"]
-        if platform.get("zoneName"):
-            fragment_parts["zoneName"] = platform["zoneName"]
-        if fragment_parts:
-            url += f"#{urlencode(fragment_parts)}"
-        return url
+        name = experiment_name or self.experiment_name or None
+        return build_job_url(job_id, platform, name)
 
     # --- Tracker operations ---
 
@@ -205,22 +182,44 @@ class Project:
         return status
 
     def record_pending_jobs(self, search_name: str, config_file: str, jobs: list,
-                            experiment_id: str | None = None, experiment_name: str | None = None) -> list[str]:
+                            experiment_id: str | None = None,
+                            experiment_name: str | None = None,
+                            replacement_ids: dict[str, str] | None = None) -> list[str]:
+        """Record jobs whose configs were modified but which await a slot.
+
+        ``replacement_ids`` maps a pending job name to the old local job ID
+        it replaces.  The old entry is intentionally kept until the
+        scheduler successfully runs the replacement; this makes a failed
+        queued submission recoverable and keeps overwrite local-only.
+        """
         with self._locked_tracker() as tracker:
             now = datetime.now().isoformat(timespec="seconds")
             job_ids = []
+            replacement_ids = replacement_ids or {}
             for j in jobs:
                 job_dict = j.to_dict() if hasattr(j, "to_dict") else j
-                queued_id = "queued-" + hashlib.md5(job_dict["name"].encode()).hexdigest()[:12]
+                name = job_dict["name"]
+                queued_id = "queued-" + hashlib.md5(name.encode()).hexdigest()[:12]
+                # A queued overwrite can have the same deterministic ID as
+                # the old queued entry.  Keep both mappings so a failed run
+                # leaves the old mapping intact.
+                if replacement_ids.get(name) == queued_id and queued_id in tracker.get("jobs", {}):
+                    suffix_seed = f"{name}:{now}:{len(job_ids)}"
+                    queued_id = queued_id + "-" + hashlib.md5(
+                        suffix_seed.encode()
+                    ).hexdigest()[:6]
                 job_ids.append(queued_id)
                 job_entry = {
-                    "name": job_dict["name"],
+                    "name": name,
                     "search_name": search_name,
                     "params": job_dict.get("params", {}),
                     "status": "Queued",
                     "submitted_at": now,
                     "job_data": job_dict,
                 }
+                old_id = replacement_ids.get(name)
+                if old_id:
+                    job_entry["replace_job_id"] = old_id
                 if experiment_id:
                     job_entry["experiment_id"] = experiment_id
                 tracker["jobs"][queued_id] = job_entry
@@ -328,3 +327,35 @@ class _LockedTracker:
 
 def extract_platform_ids(experiment_json: dict) -> dict | None:
     return Project.extract_platform_ids(experiment_json)
+
+
+def build_job_url(job_id: str, platform: dict | None,
+                  experiment_name: str | None = None) -> str | None:
+    """Build the platform job-detail URL from projset/proj/user IDs (+ names)."""
+    if not platform:
+        return None
+    required = ("projId", "projsetId", "userId")
+    if not all(platform.get(key) for key in required):
+        return None
+    params = {
+        "id": job_id,
+        "name": experiment_name or "",
+        "projId": platform["projId"],
+        "projsetId": platform["projsetId"],
+        "userId": platform["userId"],
+    }
+    if platform.get("clusterName"):
+        params = {"clusterName": platform["clusterName"], **params}
+    url = f"{PLATFORM_BASE_URL}?{urlencode(params)}"
+    fragment_parts = {}
+    if platform.get("projsetName"):
+        fragment_parts["projsetName"] = platform["projsetName"]
+    if platform.get("projectName"):
+        fragment_parts["projectName"] = platform["projectName"]
+    if platform.get("clusterName"):
+        fragment_parts["clusterName"] = platform["clusterName"]
+    if platform.get("zoneName"):
+        fragment_parts["zoneName"] = platform["zoneName"]
+    if fragment_parts:
+        url += f"#{urlencode(fragment_parts)}"
+    return url

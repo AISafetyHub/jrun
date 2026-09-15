@@ -86,3 +86,91 @@ class TestStatusColors:
         expected = {"succeed", "completed", "running", "starting", "scheduling",
                     "queued", "submitted", "failed", "stopped", "cancelled", "pending"}
         assert set(STATUS_COLORS.keys()) == expected
+
+
+class TestDisplayHelpers:
+    def test_pct(self):
+        from jrun.formatter import pct
+        assert pct(0.723) == "72.3%"
+        assert pct(-1) == "-"
+        assert pct(None) == "-"
+        assert pct(0) == "0.0%"
+
+    def test_format_ms(self):
+        from jrun.formatter import format_ms
+        assert format_ms("1788921696462") != "-"
+        assert len(format_ms("1788921696462")) == 11  # MM-DD HH:MM
+        assert format_ms("0") == "-"
+        assert format_ms(None) == "-"
+        assert format_ms("garbage") == "-"
+
+    def test_snapshot_sort_key(self):
+        from jrun.formatter import snapshot_sort_key
+        items = [
+            {"beginTime": "1000", "acceleratorReq": 1, "acceleratorUtil": 0.5,
+             "ownerName": "b"},
+            {"beginTime": "2000", "acceleratorReq": 8, "acceleratorUtil": -1,
+             "ownerName": "a"},
+        ]
+        assert sorted(items, key=snapshot_sort_key("time"))[0]["beginTime"] == "1000"
+        assert sorted(items, key=snapshot_sort_key("gpus"))[-1]["acceleratorReq"] == 8
+        # -1 utilization sorts before any real value
+        assert sorted(items, key=snapshot_sort_key("gpu"))[0]["acceleratorUtil"] == -1
+        assert sorted(items, key=snapshot_sort_key("owner"))[0]["ownerName"] == "a"
+
+    def test_print_summary_table(self, formatter, capsys):
+        rows = [
+            ("my-search (2 jobs)", "1 Running, 1 Succeed", "2024-01-01", None, "search"),
+            ("single-job", "Running", "2024-01-02", "jid-1", "job"),
+        ]
+        formatter.print_summary_table(rows, {})
+        out = capsys.readouterr().out
+        assert "my-search (2 jobs)" in out
+        assert "single-job" in out
+        assert "NAME" in out and "STATUS" in out
+
+    def test_pad_cjk_aware(self):
+        from jrun.formatter import display_width, pad
+        assert display_width("任肇兴") == 6
+        assert pad("任肇兴", 12) == "任肇兴      "
+        assert pad("abc", 5) == "abc  "
+
+
+class TestPrintExperimentJobTable:
+    def test_rows_and_header(self, capsys):
+        from jrun.formatter import print_experiment_job_table
+        print_experiment_job_table([
+            {"id": "j-1", "configName": "train-lr0.01", "status": "Running",
+             "createdTime": "1788362902921", "queueName": "q1"},
+        ])
+        out = capsys.readouterr().out
+        assert "NAME" in out and "STATUS" in out and "SUBMITTED" in out
+        assert "QUEUE" in out and "ID" in out
+        assert "train-lr0.01" in out and "Running" in out and "q1" in out
+        assert "j-1" in out
+        # submitted column mirrors `jrun job status` (ISO seconds, not MM-DD)
+        from datetime import datetime
+        expected = datetime.fromtimestamp(1788362902921 / 1000).isoformat(timespec="seconds")
+        assert expected in out
+
+    def test_links_replace_id_column(self, capsys):
+        from jrun.formatter import print_experiment_job_table
+        print_experiment_job_table(
+            [{"id": "j-1", "configName": "train", "status": "Running",
+              "createdTime": "1788362902921", "queueName": "q1"}],
+            job_urls={"j-1": "https://platform.x/job?id=j-1"},
+        )
+        out = capsys.readouterr().out
+        assert "LINK" in out and "ID" not in out.splitlines()[0]
+        assert "https://platform.x/job?id=j-1" in out
+
+    def test_missing_fields_use_placeholders(self, capsys):
+        from jrun.formatter import print_experiment_job_table
+        print_experiment_job_table([{"id": "j-9"}])
+        out = capsys.readouterr().out
+        assert "?" in out and "j-9" in out
+
+    def test_empty_prints_nothing(self, capsys):
+        from jrun.formatter import print_experiment_job_table
+        print_experiment_job_table([])
+        assert capsys.readouterr().out == ""
