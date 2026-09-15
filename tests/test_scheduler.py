@@ -4,6 +4,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+from jrun.models import Job
 from jrun.project import Project
 from jrun.scheduler import Scheduler, TERMINAL_STATUSES, ACTIVE_STATUSES
 
@@ -125,3 +126,38 @@ class TestSchedulerSync:
         assert job["platform"]["zoneName"] == "dx-calc1-zonea"
         assert job["experiment_id"] == "eid-1"
         scheduler.platform.get_job_info.assert_called_once_with("j1")
+
+    @patch("jrun.scheduler.time.sleep")
+    def test_pending_job_only_runs_existing_config_and_replaces_local_id(
+        self, mock_sleep, tmp_path
+    ):
+        project = Project.init("exp", experiment_id="eid-1", directory=tmp_path)
+        project.record_single_job("old-id", "pending-job")
+        project.record_pending_jobs(
+            "search", "config.yaml",
+            [Job(name="pending-job", command="echo hi")],
+            experiment_id="eid-1", experiment_name="exp",
+            replacement_ids={"pending-job": "old-id"},
+        )
+        scheduler = Scheduler(
+            jrun_dir=project.jrun_dir,
+            search_name="search",
+            exp_name="exp",
+            exp_id="eid-1",
+            parallel_trials=1,
+            poll_interval=0,
+        )
+        scheduler.platform = MagicMock()
+        scheduler.platform.run_config.return_value = "new-id"
+        scheduler.platform.get_job_info.return_value = {"status": "Succeed"}
+        scheduler._log = MagicMock()
+
+        scheduler.run_loop()
+
+        scheduler.platform.run_config.assert_called_once_with("eid-1", "pending-job")
+        scheduler.platform.submit_job.assert_not_called()
+        scheduler.platform.modify_configs.assert_not_called()
+        tracker = project.load_tracker()
+        assert "old-id" not in tracker["jobs"]
+        assert tracker["jobs"]["new-id"]["name"] == "pending-job"
+        assert tracker["searches"]["search"]["job_ids"] == ["new-id"]

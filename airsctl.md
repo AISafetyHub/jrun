@@ -27,7 +27,7 @@
     > 说明：将某个 job 删除（归档）。注意：只有运行结束的 job 才能删除（归档）；如果某个 job 还在运行中，请先用 stop 命令停止后再进行 cancel；提交命令后，返回 cancel 成功或者失败。
 * **修改实验配置**
     `airsctl experiment modify -f <配置文件>`
-    > 说明：配置文件可以通过查看实验详情并重定向到个人目录中获取。例如：`airsctl experiment list -N <expName> > /home/zhangsan/exp.json`；用户可根据自己的需要修改配置文件并保存（例如将 worker 数从 1 修改为 4，将 worker 的 GPU 个数从 2 修改为 4），然后执行 modify 命令使修改生效。用户此时在实验管理详情页面查看实验详情，可以看到相应的参数发生了变化。
+    > 说明：配置文件可以通过查看实验详情并重定向到个人目录中获取。例如：`airsctl experiment list -N <expName> > /home/zhangsan/exp.json`；用户可根据自己的需要修改配置文件并保存（例如将 worker 数从 1 修改为 4，将 worker 的 GPU 个数从 2 修改为 4），然后执行 modify 命令使修改生效。该命令提交的是实验的完整配置文档，`advanceConfigInfos` 列表会按文件内容整体替换，文件中省略的 config 不再属于实验当前工作集。
 * **启动 Job（按 ID）**
     `airsctl job run -e <experiment-id> -c <conf-id>`
     > 说明：根据实验 id 和配置 id 启动 job。
@@ -63,4 +63,5 @@
 
 ### 3. 注意事项
 * 使用 `airsctl job run` 命令启动 job 的前提是已经创建了实验，并填写完参数。
-* 使用 `airsctl job run (-c or -n) and (-e or -N)` 命令启动 job 后，会直接在当前实验下增加一条 job。
+* `jrun submit` 会先对当前 YAML 的全部选中任务执行一次完整 `experiment modify`，再按 config 名称调用 `job run`；后台 scheduler 对 pending config 也只执行 `job run`，不会重复 modify。
+* modify 中删除 config 不会主动停止已经启动的旧 job；jrun 的 job ID、状态和覆盖历史以本地 `.jrun/jobs.json` 为准。

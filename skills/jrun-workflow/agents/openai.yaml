@@ -1,0 +1,4 @@
+interface:
+  display_name: "jrun Workflow"
+  short_description: "Safely create and manage jrun jobs"
+  default_prompt: "Use $jrun-workflow to plan, preview, and manage a jrun job."

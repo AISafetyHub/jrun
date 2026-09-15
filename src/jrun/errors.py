@@ -21,3 +21,18 @@ class PlatformError(JrunError):
 class ConfigError(JrunError):
     """Config loading or validation error."""
     pass
+
+
+class ApiError(JrunError):
+    """Platform REST API call failed."""
+
+    def __init__(self, url: str, status_code: int | None = None, message: str = ""):
+        self.url = url
+        self.status_code = status_code
+        self.message = message
+        msg = f"{url} failed"
+        if status_code is not None:
+            msg += f" (HTTP {status_code})"
+        if message:
+            msg += f": {message}"
+        super().__init__(msg)

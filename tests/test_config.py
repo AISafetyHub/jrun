@@ -357,3 +357,136 @@ job:
         loader = ConfigLoader(cfg)
         assert loader.get_experiment_id() is None
         assert loader.get_experiment_name() is None
+
+
+class TestExperimentSpec:
+    def test_parses_experiment_block(self, write_config):
+        cfg = write_config("""
+experiment:
+  name: my-exp
+  image: harbor.x/pytorch:23.08
+  queue_name: jiuding_airs1_h100
+  cluster_id: "cid-1"
+job:
+  name: my-job
+  command: echo hello
+""")
+        spec = ConfigLoader(cfg).get_experiment_spec()
+        assert spec.name == "my-exp"
+        assert spec.image == "harbor.x/pytorch:23.08"
+        assert spec.queue_name == "jiuding_airs1_h100"
+        assert spec.cluster_id == "cid-1"
+        assert spec.zone_id is None
+
+    def test_absent_block_returns_none(self, write_config):
+        cfg = write_config("""
+job:
+  name: my-job
+  command: echo hello
+""")
+        assert ConfigLoader(cfg).get_experiment_spec() is None
+
+    def test_missing_required_fields_raises(self, write_config):
+        from jrun.errors import ConfigError
+        # Only `name` is required; image/queue live at job level now.
+        cfg = write_config("""
+experiment:
+  image: img:1
+job:
+  name: my-job
+  command: echo hello
+""")
+        with pytest.raises(ConfigError, match="name"):
+            ConfigLoader(cfg).get_experiment_spec()
+
+    def test_name_only_spec_is_valid(self, write_config):
+        cfg = write_config("""
+experiment:
+  name: my-exp
+job:
+  name: my-job
+  command: echo hello
+""")
+        spec = ConfigLoader(cfg).get_experiment_spec()
+        assert spec.name == "my-exp"
+        assert spec.image is None
+        assert spec.queue_name is None
+
+    def test_job_level_image_fields(self, write_config):
+        cfg = write_config("""
+job:
+  name: my-job
+  image: harbor.x/pytorch:23.08
+  image_region: PRIVATE
+  command: echo hello
+""")
+        job = ConfigLoader(cfg).build_single_job()
+        assert job.image == "harbor.x/pytorch:23.08"
+        assert job.image_region == "PRIVATE"
+
+    def test_grid_image_param_substitution(self, write_config):
+        cfg = write_config("""
+search:
+  job_template:
+    name: job_{model}
+    image: harbor.x/{model}:latest
+    command: echo {model}
+  sampling: grid
+  params:
+    - name: model
+      values: [m1, m2]
+""")
+        jobs = ConfigLoader(cfg).expand_grid()
+        assert [j.image for j in jobs] == ["harbor.x/m1:latest", "harbor.x/m2:latest"]
+
+    def test_variable_substitution_applies(self, write_config, monkeypatch):
+        monkeypatch.setenv("EXP_QUEUE", "queue-from-env")
+        cfg = write_config("""
+experiment:
+  name: my-exp
+  image: img:1
+  queue_name: $EXP_QUEUE
+job:
+  name: my-job
+  command: echo hello
+""")
+        assert ConfigLoader(cfg).get_experiment_spec().queue_name == "queue-from-env"
+
+    def test_image_region_optional(self, write_config):
+        cfg = write_config("""
+experiment:
+  name: my-exp
+  image: img:1
+  queue_name: q1
+job:
+  name: my-job
+  command: echo hello
+""")
+        assert ConfigLoader(cfg).get_experiment_spec().image_region == "PUBLIC"
+
+        cfg = write_config("""
+experiment:
+  name: my-exp
+  image: img:1
+  image_region: PRIVATE
+  queue_name: q1
+job:
+  name: my-job
+  command: echo hello
+""")
+        assert ConfigLoader(cfg).get_experiment_spec().image_region == "PRIVATE"
+
+    def test_invalid_image_region_raises(self, write_config):
+        from jrun.errors import ConfigError
+        cfg = write_config("""
+experiment:
+  name: my-exp
+  image: img:1
+  image_region: INTERNAL
+  queue_name: q1
+job:
+  name: my-job
+  command: echo hello
+""")
+        with pytest.raises(ConfigError, match="unknown image_region"):
+            ConfigLoader(cfg).get_experiment_spec()
