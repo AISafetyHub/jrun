@@ -1,38 +1,42 @@
-import json
 import pytest
-from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from jrun.project import Project
+from jrun.project import Project, build_job_url
 
 
 @pytest.fixture
 def project(tmp_path):
-    return Project.init("test-exp", experiment_id="abc-123", directory=tmp_path)
+    return Project.init(directory=tmp_path)
 
 
 class TestProjectInit:
     def test_creates_jrun_dir(self, tmp_path):
-        Project.init("my-exp", directory=tmp_path)
+        Project.init(directory=tmp_path)
         assert (tmp_path / ".jrun").is_dir()
         assert (tmp_path / ".jrun" / "settings.json").is_file()
 
-    def test_settings_content(self, tmp_path):
-        p = Project.init("my-exp", experiment_id="eid-1", directory=tmp_path)
-        assert p.experiment_name == "my-exp"
-        assert p.experiment_id == "eid-1"
+    def test_settings_is_only_a_marker(self, tmp_path):
+        Project.init(directory=tmp_path)
+        assert (tmp_path / ".jrun" / "settings.json").read_text() == "{}\n"
+        assert not hasattr(Project, "experiment_id")
+        assert not hasattr(Project, "platform_ids")
 
-    def test_with_platform(self, tmp_path):
-        platform = {"projId": "p1", "projsetId": "ps1", "userId": "u1"}
-        p = Project.init("exp", experiment_id="e1", platform=platform, directory=tmp_path)
-        assert p.platform_ids == platform
+    def test_init_keeps_existing_settings(self, tmp_path):
+        Project.init(directory=tmp_path)
+        (tmp_path / ".jrun" / "settings.json").write_text('{"experiment_id": "old"}')
+        Project.init(directory=tmp_path)
+        assert "old" in (tmp_path / ".jrun" / "settings.json").read_text()
+
+    def test_missing_project_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="jrun init"):
+            Project(start=tmp_path)
 
     def test_find_from_subdirectory(self, tmp_path):
-        Project.init("exp", experiment_id="e1", directory=tmp_path)
+        Project.init(directory=tmp_path)
         sub = tmp_path / "a" / "b"
         sub.mkdir(parents=True)
         p = Project(start=sub)
-        assert p.experiment_name == "exp"
+        assert p.jrun_dir == (tmp_path / ".jrun").resolve()
 
 
 class TestProjectTracker:
@@ -111,13 +115,11 @@ class TestProjectTracker:
 
 
 class TestBuildJobUrl:
-    def test_no_platform(self, tmp_path):
-        p = Project.init("exp", experiment_id="e1", directory=tmp_path)
-        assert p.build_job_url("job-id") is None
+    def test_no_platform(self):
+        assert build_job_url("job-id", None) is None
+        assert build_job_url("job-id", {"projId": "p"}) is None
 
-    def test_with_platform(self, tmp_path):
-        project_platform = {"projId": "old", "projsetId": "old", "userId": "old"}
-        p = Project.init("exp", experiment_id="e1", platform=project_platform, directory=tmp_path)
+    def test_with_platform(self):
         job_platform = {
             "projId": "e31a8bd7-5c5e-47d5-a070-4ab934bff3c9",
             "projsetId": "a7d74c82-9265-41a6-a5c8-9828efde24ae",
@@ -127,9 +129,7 @@ class TestBuildJobUrl:
             "clusterName": "dx-calc1",
             "zoneName": "dx-calc1-zonea",
         }
-        url = p.build_job_url(
-            "job-id-123", platform=job_platform, experiment_name="test"
-        )
+        url = build_job_url("job-id-123", job_platform, "test")
         parsed = urlparse(url)
         assert parsed.netloc == "platform-multi.baai.ac.cn"
         assert parse_qs(parsed.query) == {
@@ -193,7 +193,7 @@ class TestExtractPlatformIds:
 
 class TestTrackerExperimentId:
     def test_record_search_stores_experiment_id(self, tmp_path):
-        p = Project.init("exp", experiment_id="default-eid", directory=tmp_path)
+        p = Project.init(directory=tmp_path)
         entries = [{"job_id": "j1", "name": "job1", "params": {}}]
         p.record_search("s1", "config.yaml", entries,
                         experiment_id="custom-eid", experiment_name="custom-exp")
@@ -201,9 +201,11 @@ class TestTrackerExperimentId:
         assert tracker["searches"]["s1"]["experiment_id"] == "custom-eid"
         assert tracker["searches"]["s1"]["experiment_name"] == "custom-exp"
         assert tracker["jobs"]["j1"]["experiment_id"] == "custom-eid"
+        # job rows carry the name too, so job links can be built per job
+        assert tracker["jobs"]["j1"]["experiment_name"] == "custom-exp"
 
     def test_record_search_without_experiment_id(self, tmp_path):
-        p = Project.init("exp", experiment_id="default-eid", directory=tmp_path)
+        p = Project.init(directory=tmp_path)
         entries = [{"job_id": "j1", "name": "job1", "params": {}}]
         p.record_search("s1", "config.yaml", entries)
         tracker = p.load_tracker()
@@ -211,7 +213,7 @@ class TestTrackerExperimentId:
         assert "experiment_id" not in tracker["jobs"]["j1"]
 
     def test_record_single_job_stores_experiment_id(self, tmp_path):
-        p = Project.init("exp", experiment_id="default-eid", directory=tmp_path)
+        p = Project.init(directory=tmp_path)
         p.record_single_job("j1", "job1",
                             experiment_id="custom-eid", experiment_name="custom-exp")
         tracker = p.load_tracker()
@@ -219,7 +221,7 @@ class TestTrackerExperimentId:
         assert tracker["jobs"]["j1"]["experiment_name"] == "custom-exp"
 
     def test_record_pending_jobs_stores_experiment_id(self, tmp_path):
-        p = Project.init("exp", experiment_id="default-eid", directory=tmp_path)
+        p = Project.init(directory=tmp_path)
         jobs = [{"name": "pending1", "command": "echo", "params": {}, "resource_config": {}, "envs": {}}]
         ids = p.record_pending_jobs("s1", "config.yaml", jobs,
                                     experiment_id="custom-eid", experiment_name="custom-exp")

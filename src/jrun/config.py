@@ -2,22 +2,39 @@ import hashlib
 import itertools
 import os
 import re
+from dataclasses import fields
 from pathlib import Path
 
 import yaml
 
 from jrun.errors import ConfigError
-from jrun.models import ExperimentSpec, Job, ResourceConfig
+from jrun.models import ExperimentSpec, Job
+
+# Keys that used to be accepted on search:/job: sections. They are rejected
+# with a pointer to the replacement instead of being silently forwarded to the
+# platform as unknown fields.
+_REMOVED_SECTION_KEYS = {
+    "experiment_id": "bind the config with a top-level 'experiment:' block",
+    "experiment_name": "bind the config with a top-level 'experiment:' block",
+    "submission": "use 'run_options:'",
+}
 
 
 class ConfigLoader:
+    """Load a jrun YAML config and expand it into Job objects.
+
+    Every validation problem is raised as ConfigError.
+    """
+
     def __init__(self, config_path: str):
         self.path = Path(config_path).resolve()
         self.config = self._load_and_resolve()
 
     def _load_and_resolve(self) -> dict:
-        with open(self.path) as f:
-            raw = f.read()
+        try:
+            raw = self.path.read_text()
+        except OSError as e:
+            raise ConfigError(f"cannot read config {self.path}: {e}") from e
 
         jrun_vars = {"CONFIG_DIR": str(self.path.parent)}
 
@@ -31,20 +48,54 @@ class ConfigLoader:
             val = os.environ.get(name)
             if val is not None:
                 return val
-            raise ValueError(f"Undefined variable: ${name}")
+            raise ConfigError(
+                f"undefined variable ${name} (use $${name} to pass it through "
+                "to the remote job)"
+            )
 
-        # Process variable substitution line by line, skipping comment-only lines
-        lines = raw.split("\n")
-        resolved_lines = []
-        for line in lines:
-            if line.lstrip().startswith("#"):
-                resolved_lines.append(line)
-            else:
-                resolved_lines.append(re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", _resolve, line))
-        raw = "\n".join(resolved_lines)
-        raw = raw.replace(placeholder, "$")
+        # Substitute line by line, skipping comment-only lines.
+        lines = [
+            line if line.lstrip().startswith("#")
+            else re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", _resolve, line)
+            for line in raw.split("\n")
+        ]
+        raw = "\n".join(lines).replace(placeholder, "$")
 
-        return yaml.safe_load(raw)
+        try:
+            data = yaml.safe_load(raw)
+        except yaml.YAMLError as e:
+            raise ConfigError(f"invalid YAML in {self.path}: {e}") from e
+        if not isinstance(data, dict):
+            raise ConfigError(f"{self.path}: top level must be a mapping")
+        for section_name in ("search", "job"):
+            section = data.get(section_name) or {}
+            for key, hint in _REMOVED_SECTION_KEYS.items():
+                if key in section:
+                    raise ConfigError(
+                        f"{section_name}.{key} is no longer supported; {hint}"
+                    )
+        template = (data.get("search") or {}).get("job_template") or {}
+        for key, hint in _REMOVED_SECTION_KEYS.items():
+            if key in template:
+                raise ConfigError(
+                    f"search.job_template.{key} is no longer supported; {hint}"
+                )
+        return data
+
+    # --- jobs ---
+
+    def jobs(self) -> list[Job]:
+        """All jobs in the config: the expanded grid, or the single job."""
+        if self.config.get("search"):
+            return self.expand_grid()
+        single = self.build_single_job()
+        if not single:
+            raise ConfigError("config has neither 'search' nor 'job' section")
+        return [single]
+
+    @property
+    def is_search(self) -> bool:
+        return bool(self.config.get("search"))
 
     def expand_grid(self) -> list[Job]:
         search = self.config.get("search")
@@ -53,67 +104,57 @@ class ConfigLoader:
 
         sampling = search.get("sampling", "grid")
         if sampling != "grid":
-            raise ValueError(f"Unsupported sampling method: '{sampling}'. Only 'grid' is supported.")
+            raise ConfigError(
+                f"unsupported sampling method '{sampling}'; only 'grid' is supported"
+            )
+        template = search.get("job_template")
+        if not isinstance(template, dict) or not template.get("name"):
+            raise ConfigError("search.job_template with a 'name' is required")
 
-        template = search["job_template"]
         params = search.get("params", [])
         max_trials = search.get("max_trials", 9999)
-
-        param_names = [p["name"] for p in params]
-        param_values = [p["values"] for p in params]
+        try:
+            param_names = [p["name"] for p in params]
+            param_values = [p["values"] for p in params]
+        except (KeyError, TypeError) as e:
+            raise ConfigError("each search param needs 'name' and 'values'") from e
 
         jobs = []
         for combo in itertools.product(*param_values):
             if len(jobs) >= max_trials:
                 break
-
             mapping = dict(zip(param_names, combo))
-
-            name = template["name"]
-            for k, v in mapping.items():
-                name = name.replace(f"{{{k}}}", str(v))
-            name = self._resolve_auto(name, mapping)
-
-            command = self._resolve_command(
-                template.get("commands", template.get("command", "")), mapping
-            )
-
-            envs = template.get("envs", {})
-            if envs:
-                resolved_envs = {}
-                for ek, ev in envs.items():
-                    val = str(ev)
-                    for k, v in mapping.items():
-                        val = val.replace(f"{{{k}}}", str(v))
-                    resolved_envs[ek] = val
-                envs = resolved_envs
-
-            jobs.append(Job(
-                name=name,
-                command=command,
-                params=mapping,
-                resource_config=ResourceConfig.from_dict(template.get("resource_config", {})),
-                envs=envs,
-                image=self._subst_params(template.get("image"), mapping),
-                image_region=self._subst_params(template.get("image_region"), mapping),
-            ))
-
+            data = self._substitute(template, mapping)
+            data["name"] = self._resolve_auto(data["name"], mapping)
+            jobs.append(self._make_job(data, params=mapping))
         return jobs
 
     def build_single_job(self) -> Job | None:
         job = self.config.get("job")
         if not job:
             return None
-        command = self._resolve_command(job.get("commands", job.get("command", "")), {})
-        return Job(
-            name=job["name"],
-            command=command,
-            params={},
-            resource_config=ResourceConfig.from_dict(job.get("resource_config", {})),
-            envs=job.get("envs", {}),
-            image=job.get("image"),
-            image_region=job.get("image_region"),
+        return self._make_job(dict(job), params={})
+
+    def _make_job(self, data: dict, params: dict) -> Job:
+        data["command"] = self._join_command(
+            data.pop("commands", None) if "commands" in data else data.get("command", "")
         )
+        data["params"] = params
+        data["envs"] = {str(k): str(v) for k, v in (data.get("envs") or {}).items()}
+        # Unknown job keys are typos, not platform fields: raw platform fields
+        # must go through `platform_overrides:` explicitly.
+        unknown = sorted(set(data) - {f.name for f in fields(Job)})
+        if unknown:
+            raise ConfigError(
+                f"job '{data.get('name')}': unknown field(s) {', '.join(unknown)} "
+                "(put raw platform fields under platform_overrides:)"
+            )
+        try:
+            return Job.from_dict(data)
+        except ValueError as e:
+            raise ConfigError(str(e)) from e
+
+    # --- other sections ---
 
     def get_search_name(self) -> str | None:
         search = self.config.get("search")
@@ -123,70 +164,49 @@ class ConfigLoader:
             return search["name"]
         name_tmpl = search["job_template"]["name"]
         clean = re.sub(r"\{[^}]+\}", "", name_tmpl)
-        clean = re.sub(r"_+", "_", clean).strip("_")
-        return clean
-
-    def get_experiment_id(self) -> str | None:
-        section = self.config.get("search") or self.config.get("job") or {}
-        return section.get("experiment_id")
+        return re.sub(r"_+", "_", clean).strip("_")
 
     def get_experiment_spec(self) -> ExperimentSpec | None:
-        """Parse the top-level `experiment:` block, or None if absent.
-
-        Only `name` is required; image/queue live at job level (the spec's
-        deprecated image/queue_name fields remain as fallbacks).
-        """
+        """Parse the top-level `experiment:` block, or None if absent."""
         section = self.config.get("experiment")
         if not section:
             return None
-        if not section.get("name"):
-            raise ConfigError("experiment section missing required field: name")
         try:
             return ExperimentSpec.from_dict(section)
         except ValueError as e:
             raise ConfigError(str(e)) from e
 
-    def get_experiment_name(self) -> str | None:
-        section = self.config.get("search") or self.config.get("job") or {}
-        return section.get("experiment_name")
-
     def get_scheduler_params(self) -> dict:
-        search = self.config.get("search", {})
+        search = self.config.get("search") or {}
         return {
             "parallel_trials": search.get("parallel_trials"),
             "poll_interval": search.get("poll_interval", 30),
         }
 
-    @staticmethod
-    def _subst_params(text, mapping: dict) -> str | None:
-        """{param} substitution for optional scalar fields (image etc.)."""
-        if text is None:
-            return None
-        val = str(text)
-        for k, v in mapping.items():
-            val = val.replace(f"{{{k}}}", str(v))
-        return val
+    # --- substitution helpers ---
+
+    @classmethod
+    def _substitute(cls, value, mapping: dict):
+        """Substitute {param} placeholders through nested config values."""
+        if isinstance(value, dict):
+            return {k: cls._substitute(v, mapping) for k, v in value.items()}
+        if isinstance(value, list):
+            return [cls._substitute(v, mapping) for v in value]
+        if isinstance(value, str):
+            for k, v in mapping.items():
+                value = value.replace(f"{{{k}}}", str(v))
+        return value
 
     @staticmethod
     def _resolve_auto(name_template: str, params: dict | None = None) -> str:
         def replacer(m):
             seed = str(sorted((params or {}).items())).encode()
-            length = int(re.search(r"\d+", m.group()).group())
-            return hashlib.md5(seed).hexdigest()[:length]
+            return hashlib.md5(seed).hexdigest()[:int(m.group(1))]
         return re.sub(r"\{auto:(\d+)s?\}", replacer, name_template)
 
     @staticmethod
-    def _resolve_command(cmd_raw, mapping: dict) -> str:
+    def _join_command(cmd_raw) -> str:
+        """`commands:` lists are joined with newlines (one shell line each)."""
         if isinstance(cmd_raw, list):
-            parts = []
-            for cmd in cmd_raw:
-                resolved = str(cmd)
-                for k, v in mapping.items():
-                    resolved = resolved.replace(f"{{{k}}}", str(v))
-                parts.append(resolved)
-            return "\n".join(parts)
-        else:
-            resolved = str(cmd_raw)
-            for k, v in mapping.items():
-                resolved = resolved.replace(f"{{{k}}}", str(v))
-            return resolved
+            return "\n".join(str(c) for c in cmd_raw)
+        return "" if cmd_raw is None else str(cmd_raw)

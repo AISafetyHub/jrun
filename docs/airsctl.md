@@ -35,6 +35,17 @@
     `airsctl job run -N <experiment-name> -n <config-name>`
     > 说明：根据实验名称和配置名称启动 job。
 
+公共资源池的 `job run` 还支持：
+
+* `--duration-hours <小时>`：预计运行时长。
+* `--queue-priority-mode normal|high`：公共队列优先级模式。
+* `--usage-desc <用途>`：公共队列用途说明。
+* `--enable-checkpoint`：启用公共队列 checkpoint。
+
+`jrun` 的 `PlatformClient.job_run()` 会把 YAML `run_options` 中已填写的字段转换成这些参数，与队列类别无关（专属/闲时队列只要填写了也会传递）；但只有公共队列会校验并要求 `duration_hours`、`queue_priority_mode`、`usage_desc` 三项必填。`airsctl job run` 的输出中找不到 job ID 时，jrun 将其视为该任务提交失败。
+
+`jrun queues` 同时读取专属队列和 `/api/v1/shared-queue/list` 的共享资源池，展示每种卡型的总量、已用量和空闲量。公共和闲时是同一批共享资源池的两种提交方式，所以每个共享资源池会在 `public` 和 `idle` 下各出现一次，RUN/LIMIT 分别来自 `shared-queue/job-count` 和 `shared-queue/config`。
+
 ---
 
 ### 2. 更多命令和参数详情
@@ -64,4 +75,6 @@
 ### 3. 注意事项
 * 使用 `airsctl job run` 命令启动 job 的前提是已经创建了实验，并填写完参数。
 * `jrun submit` 会先对当前 YAML 的全部选中任务执行一次完整 `experiment modify`，再按 config 名称调用 `job run`；后台 scheduler 对 pending config 也只执行 `job run`，不会重复 modify。
-* modify 中删除 config 不会主动停止已经启动的旧 job；jrun 的 job ID、状态和覆盖历史以本地 `.jrun/jobs.json` 为准。
+* `jrun job remove` 先对仍在进行中的 job 调用 `job stop` 并轮询（最多 60 秒）直到其结束，再调用 `job cancel` 归档并删除 config；按上面的说明，`job cancel` 只对已结束的 job 生效；以前 remove 只调用 cancel，Pending/Running 的 job 在平台上会继续运行。等待后仍未结束的 job 保留在 `.jrun/jobs.json` 中。
+* modify 中删除 config 不会主动停止已经启动的旧 job；但 jrun 覆盖同名任务时，会在 modify 之前先对仍在运行/排队的旧 job 调用 `airsctl job stop`（scheduler 持有的 `queued-*` 记录只在本地标记为 `Stopped`；平台上的 `Pending`/`Approving` job 同样会调用 `job stop`，已结束的 job 不处理）。网格搜索中某个旧 job 停止失败时只跳过该任务；单任务停止失败则中止提交。jrun 的 job ID、状态和覆盖历史以本地 `.jrun/jobs.json` 为准。
+* `airsctl experiment list -e/-N` 返回的是裸的 snake_case 文档（如 `experiment_id`、`advance_config_infos`），jrun 的 `platform.py` 只按 snake_case 解析；按名称查找实验时要求名称精确匹配。

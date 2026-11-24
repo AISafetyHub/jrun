@@ -5,17 +5,10 @@ description: Grid search test - evaluate models on multiple datasets
 # config). Requires credentials (`jrun login`, or /etc/accesskey on platform
 # pods). See `jrun queues` for queue options.
 experiment:
-  name: jrun_example_search
-
+  name: jrun_example
 
 search:
   name: test_eval
-
-  # (optional) Submit to an existing experiment by ID/name.
-  # If omitted, uses the experiment: block above or the default from
-  # `.jrun/settings.json`.
-  # experiment_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-  # experiment_name: my_other_experiment
 
   job_template:
     name: test_eval_{model}_{data}_{auto:4s}
@@ -29,6 +22,11 @@ search:
         MODEL_NAME: "{model}",
       }
     resource_config:
+      queue_category: dedicated
+      project_set_name: baai-safety
+      project_name: baai-safety_research
+      region_name: 北京-大兴
+      zone_name: 可用区A
       queue_name: baai-safety_research_yybu-private
       priority: high
       accelerator_model: NVIDIA_A100-SXM4-40GB

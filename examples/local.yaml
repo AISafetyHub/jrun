@@ -1,16 +1,17 @@
 description: Local job test - simple echo task
 
+# Local jobs (queue_name: local) run on this machine and never touch the
+# platform; the experiment block is only needed once queue_name points at a
+# real queue. jrun exits with the command's exit code.
+experiment:
+  name: jrun_example
+
 job:
   name: test_local_echo
 
-  # (optional) Submit to an existing experiment by ID/name.
-  # If omitted, uses the experiment: block above or the default from
-  # `.jrun/settings.json`.
-  # experiment_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-  # experiment_name: my_other_experiment
-
   command: echo "Hello from jrun local job test"
   resource_config:
+    queue_category: dedicated
     queue_name: local
     priority: high
     accelerator_model: NVIDIA-A100-SXM4-40GB

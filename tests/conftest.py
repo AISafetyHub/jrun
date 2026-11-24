@@ -1,7 +1,17 @@
 import json
+import urllib.request
 
 import pytest
 from click.testing import CliRunner
+
+
+@pytest.fixture(autouse=True)
+def _no_real_http(monkeypatch):
+    """Fail fast on real platform HTTP calls (tests inject fake openers)."""
+    def blocked(self, request, *args, **kwargs):
+        url = getattr(request, "full_url", request)
+        raise RuntimeError(f"real HTTP request in a test: {url}")
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", blocked)
 
 
 @pytest.fixture
@@ -13,8 +23,7 @@ def runner():
 def project_dir(tmp_path):
     jrun_dir = tmp_path / ".jrun"
     jrun_dir.mkdir()
-    settings = {"experiment_name": "test-exp", "experiment_id": "eid-123"}
-    (jrun_dir / "settings.json").write_text(json.dumps(settings))
+    (jrun_dir / "settings.json").write_text("{}\n")
     (jrun_dir / "jobs.json").write_text(json.dumps({"searches": {}, "jobs": {}}))
     return tmp_path
 

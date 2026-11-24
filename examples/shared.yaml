@@ -1,0 +1,28 @@
+description: Submit to a Jiuding public or idle shared queue
+
+experiment:
+  name: jrun_example
+
+job:
+  name: public-v100-smoke
+  image: harbor.baai.ac.cn/llm-safety-center/enviroments:agents-v1.0.0
+  commands:
+    - sleep 10
+    - echo "Hello from jrun shared queue test"
+  resource_config:
+    queue_category: public
+    project_set_name: baai-safety
+    project_name: baai-safety_research
+    region_name: 北京-大兴
+    zone_name: 可用区A
+    queue_name: Public-Pool-NVIDIA-V100
+    accelerator_model: NVIDIA_V100-PCIE-32GB
+    accelerator_count: 0
+    cpu_cores: 8
+    mem_gib: 64
+    shared_mem_gib: 16
+  run_options:
+    duration_hours: 12
+    queue_priority_mode: normal
+    usage_desc: smoke test
+    enable_checkpoint: false

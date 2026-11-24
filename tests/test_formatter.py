@@ -1,31 +1,14 @@
 import pytest
-from unittest.mock import MagicMock, patch
-from pathlib import Path
 
 from jrun.formatter import StatusFormatter, STATUS_COLORS
-from jrun.project import Project
 
 
 @pytest.fixture
-def formatter(tmp_path):
-    project = Project.init("exp", experiment_id="e1", directory=tmp_path)
-    return StatusFormatter(project)
-
-
-@pytest.fixture
-def formatter_with_links(tmp_path):
-    platform = {"projId": "p1", "projsetId": "ps1", "userId": "u1"}
-    project = Project.init("exp", experiment_id="e1", platform=platform, directory=tmp_path)
-    return StatusFormatter(project)
+def formatter():
+    return StatusFormatter()
 
 
 class TestStatusFormatter:
-    def test_has_links_false(self, formatter):
-        assert formatter.has_links is False
-
-    def test_has_links_true(self, formatter_with_links):
-        assert formatter_with_links.has_links is True
-
     def test_colored_status_known(self, formatter):
         result = formatter.colored_status("Running", 10)
         assert len(result) > 0
@@ -59,6 +42,17 @@ class TestStatusFormatter:
         assert "job-1" in captured.out
         assert "job-2" in captured.out
 
+    def test_cjk_job_names_keep_columns_aligned(self, formatter, capsys):
+        formatter.print_job_table({
+            "j1": {"name": "北京训练任务", "status": "Running", "submitted_at": "2024-01-01T00:00:00"},
+            "j2": {"name": "short", "status": "Failed", "submitted_at": "2024-01-02T00:00:00"},
+        })
+        lines = capsys.readouterr().out.splitlines()
+        from jrun.formatter import display_width
+        assert display_width(lines[0][:lines[0].index("SUBMITTED")]) == display_width(
+            lines[2][:lines[2].index("2024-01-01")]
+        )
+
     def test_print_job_table_with_job_platform(self, formatter, capsys):
         jobs = {
             "j1": {
@@ -83,8 +77,8 @@ class TestStatusFormatter:
 
 class TestStatusColors:
     def test_all_known_statuses_have_colors(self):
-        expected = {"succeed", "completed", "running", "starting", "scheduling",
-                    "queued", "submitted", "failed", "stopped", "cancelled", "pending"}
+        from jrun.models import ACTIVE_STATUSES, TERMINAL_STATUSES
+        expected = {s.lower() for s in ACTIVE_STATUSES | TERMINAL_STATUSES}
         assert set(STATUS_COLORS.keys()) == expected
 
 

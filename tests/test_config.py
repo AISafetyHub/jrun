@@ -1,8 +1,7 @@
-import os
 import pytest
-from pathlib import Path
 
 from jrun.config import ConfigLoader
+from jrun.errors import ConfigError
 
 
 @pytest.fixture
@@ -83,7 +82,7 @@ job:
   name: test
   command: echo $UNDEFINED_XYZ_VAR
 """)
-        with pytest.raises(ValueError, match="Undefined variable"):
+        with pytest.raises(ConfigError, match=r"undefined variable \$UNDEFINED_XYZ_VAR"):
             ConfigLoader(cfg)
 
     def test_dollar_dollar_escaping(self, write_config):
@@ -219,7 +218,7 @@ search:
       values: [1]
 """)
         loader = ConfigLoader(cfg)
-        with pytest.raises(ValueError, match="Unsupported sampling"):
+        with pytest.raises(ConfigError, match="unsupported sampling"):
             loader.expand_grid()
 
 
@@ -319,44 +318,121 @@ search:
         assert jobs[0].name != jobs[1].name
 
 
-class TestExperimentId:
-    def test_search_experiment_id(self, write_config):
+class TestRemovedAndInvalidKeys:
+    @pytest.mark.parametrize("section,key", [
+        ("search", "experiment_id"),
+        ("search", "experiment_name"),
+        ("job", "experiment_id"),
+        ("job", "experiment_name"),
+        ("job", "submission"),
+    ])
+    def test_legacy_section_keys_rejected(self, write_config, section, key):
+        body = ("job:\n  name: j\n  command: c\n" if section == "job" else
+                "search:\n  job_template:\n    name: j-{x}\n    command: c\n"
+                "  params:\n    - name: x\n      values: [1]\n")
+        cfg = write_config(body + f"  {key}: value\n")
+        with pytest.raises(ConfigError, match=f"{section}.{key} is no longer supported"):
+            ConfigLoader(cfg)
+
+    def test_legacy_key_in_job_template_rejected(self, write_config):
         cfg = write_config("""
 search:
-  experiment_id: "custom-exp-id-123"
-  experiment_name: "custom-exp"
   job_template:
-    name: job-{x}
-    command: echo {x}
+    name: j-{x}
+    command: c
+    submission: {duration_hours: 1}
   params:
     - name: x
       values: [1]
 """)
-        loader = ConfigLoader(cfg)
-        assert loader.get_experiment_id() == "custom-exp-id-123"
-        assert loader.get_experiment_name() == "custom-exp"
+        with pytest.raises(ConfigError, match="job_template.submission"):
+            ConfigLoader(cfg)
 
-    def test_job_experiment_id(self, write_config):
+    def test_worker_rejected(self, write_config):
         cfg = write_config("""
 job:
-  name: my-job
-  command: echo hello
-  experiment_id: "job-exp-id-456"
-  experiment_name: "job-exp"
+  name: j
+  command: c
+  resource_config:
+    worker: {replicas: 2}
 """)
-        loader = ConfigLoader(cfg)
-        assert loader.get_experiment_id() == "job-exp-id-456"
-        assert loader.get_experiment_name() == "job-exp"
+        with pytest.raises(ConfigError, match="worker was removed"):
+            ConfigLoader(cfg).jobs()
 
-    def test_no_experiment_id(self, write_config):
+    def test_unknown_job_field_rejected(self, write_config):
         cfg = write_config("""
 job:
-  name: my-job
-  command: echo hello
+  name: j
+  comand: typo
 """)
-        loader = ConfigLoader(cfg)
-        assert loader.get_experiment_id() is None
-        assert loader.get_experiment_name() is None
+        with pytest.raises(ConfigError, match="unknown field.*comand"):
+            ConfigLoader(cfg).jobs()
+
+    def test_platform_overrides_explicitly_allowed(self, write_config):
+        cfg = write_config("""
+job:
+  name: j
+  command: c
+  platform_overrides: {slots_per_worker: 2}
+""")
+        assert ConfigLoader(cfg).jobs()[0].platform_overrides == {"slots_per_worker": 2}
+
+    def test_invalid_yaml(self, write_config):
+        cfg = write_config("job: [unclosed\n")
+        with pytest.raises(ConfigError, match="invalid YAML"):
+            ConfigLoader(cfg)
+
+    def test_missing_file(self, tmp_path):
+        with pytest.raises(ConfigError, match="cannot read config"):
+            ConfigLoader(str(tmp_path / "missing.yaml"))
+
+    def test_neither_search_nor_job(self, write_config):
+        cfg = write_config("experiment:\n  name: e\n")
+        with pytest.raises(ConfigError, match="neither 'search' nor 'job'"):
+            ConfigLoader(cfg).jobs()
+
+
+class TestJobsAndCommands:
+    def test_jobs_single_and_search(self, write_config):
+        single = ConfigLoader(write_config("job:\n  name: a\n  command: c\n", "a.yaml"))
+        assert [j.name for j in single.jobs()] == ["a"]
+        assert single.is_search is False
+        search = ConfigLoader(write_config(
+            "search:\n  job_template:\n    name: b-{x}\n    command: c\n"
+            "  params:\n    - name: x\n      values: [1, 2]\n", "b.yaml"))
+        assert [j.name for j in search.jobs()] == ["b-1", "b-2"]
+        assert search.is_search is True
+
+    def test_commands_joined_with_newlines(self, write_config):
+        cfg = write_config("""
+job:
+  name: j
+  commands:
+    - cd /work
+    - python train.py
+""")
+        assert ConfigLoader(cfg).jobs()[0].command == "cd /work\npython train.py"
+
+    def test_grid_params_substitute_nested_fields(self, write_config):
+        cfg = write_config("""
+search:
+  job_template:
+    name: j-{n}
+    commands: ["run --n {n}"]
+    image: img:{n}
+    resource_config:
+      accelerator_count: 1
+      roles:
+        - {name: Worker, replicas: 2, accelerator_model: "M{n}"}
+  params:
+    - name: n
+      values: [7]
+""")
+        job = ConfigLoader(cfg).jobs()[0]
+        assert job.command == "run --n 7"
+        assert job.image == "img:7"
+        assert job.resource_config.roles[0].accelerator_model == "M7"
+        assert job.params == {"n": 7}
 
 
 class TestExperimentSpec:
@@ -366,7 +442,10 @@ experiment:
   name: my-exp
   image: harbor.x/pytorch:23.08
   queue_name: jiuding_airs1_h100
-  cluster_id: "cid-1"
+  project_set_name: ps
+  project_name: project
+  region_name: region
+  zone_name: zone
 job:
   name: my-job
   command: echo hello
@@ -375,8 +454,10 @@ job:
         assert spec.name == "my-exp"
         assert spec.image == "harbor.x/pytorch:23.08"
         assert spec.queue_name == "jiuding_airs1_h100"
-        assert spec.cluster_id == "cid-1"
-        assert spec.zone_id is None
+        assert spec.project_set_name == "ps"
+        assert spec.project_name == "project"
+        assert spec.region_name == "region"
+        assert spec.zone_name == "zone"
 
     def test_absent_block_returns_none(self, write_config):
         cfg = write_config("""
@@ -462,7 +543,7 @@ job:
   name: my-job
   command: echo hello
 """)
-        assert ConfigLoader(cfg).get_experiment_spec().image_region == "PUBLIC"
+        assert ConfigLoader(cfg).get_experiment_spec().image_region is None
 
         cfg = write_config("""
 experiment:
