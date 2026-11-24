@@ -11,8 +11,10 @@ import pytest
 from jrun.api import (
     PlatformAPI,
     compute_signature,
+    filter_queues,
     queue_location_info,
     save_auth,
+    with_project_context,
 )
 from jrun.errors import ApiError
 
@@ -336,6 +338,34 @@ class TestQueues:
         api2 = PlatformAPI(opener=opener2, ak="ak", sk="sk")
         assert api2.find_queue("nope", projset_id="ps1") is None
 
+    def test_find_queue_resolves_names_and_rejects_ambiguous_location(self):
+        rows = [
+            {**SAMPLE_QUEUE, "name": "same", "projName": "project",
+             "projsetName": "set", "clusterDisplayName": "region-a",
+             "zoneDisplayName": "zone-a", "quotaInfoList": []},
+            {**SAMPLE_QUEUE, "name": "same", "projName": "project",
+             "projsetName": "set", "clusterDisplayName": "region-b",
+             "zoneDisplayName": "zone-b", "zoneId": "zone-b", "quotaInfoList": []},
+        ]
+        opener = FakeOpener({"token": "t"},
+                            {"items": [{"projsetInfo": {"id": "ps", "name": "set"}}]},
+                            {"queueSummaryInfos": rows},
+                            {"queueSummaryInfos": rows})
+        api = PlatformAPI(opener=opener, ak="ak", sk="sk")
+        with pytest.raises(ValueError, match="multiple locations"):
+            api.find_queue("same", project_set_name="set", project_name="project")
+
+        opener = FakeOpener({"token": "t"},
+                            {"items": [{"projsetInfo": {"id": "ps", "name": "set"}}]},
+                            {"queueSummaryInfos": rows},
+                            {"queueSummaryInfos": rows})
+        api = PlatformAPI(opener=opener, ak="ak", sk="sk")
+        result = api.find_queue(
+            "same", project_set_name="set", project_name="project",
+            region_name="region-b", zone_name="zone-b",
+        )
+        assert result["zoneId"] == "zone-b"
+
 
 class TestQueueFreeResources:
     def test_empty_used_means_all_free(self):
@@ -359,6 +389,52 @@ class TestQueueFreeResources:
     def test_no_quota_returns_empty(self):
         assert PlatformAPI.queue_free_resources({}) == []
 
+    def test_shared_queue_resources(self):
+        queue = {
+            "acceleratorModel": "H20",
+            "quota": {"acceleratorCount": 8},
+            "used": {"acceleratorCount": 3},
+        }
+        assert PlatformAPI.queue_free_resources(queue) == [
+            {"model": "H20", "total": 8, "used": 3, "free": 5}
+        ]
+
+
+class TestSharedQueues:
+    def test_list_shared_queues_and_counts(self):
+        shared = {
+            "paging": {"total": 1},
+            "sharedQueues": [{
+                "queueId": "shared-q", "name": "Public-Pool-H20",
+                "acceleratorModel": "H20", "quotaId": "quota",
+                "sharedQuotaId": "shared-quota",
+            }],
+        }
+        counts = {"paging": {"total": 1}, "items": [{
+            "queue": {"queueId": "shared-q"}, "runningCount": 2,
+        }]}
+        opener = FakeOpener({"token": "t"}, shared, counts)
+        api = PlatformAPI(opener=opener, ak="ak", sk="sk")
+        rows = api.list_shared_queues(proj_id="p", projset_id="ps", queue_category="public")
+        assert rows[0]["queueCategory"] == "QUEUE_CATEGORY_PUBLIC"
+        job_counts = api.list_shared_queue_job_counts(
+            proj_id="p", projset_id="ps", queue_category="public"
+        )
+        assert job_counts[0]["runningCount"] == 2
+
+    def test_shared_location_and_limits(self):
+        queue = {
+            "queueId": "shared-q", "name": "Public-Pool-H20",
+            "quotaId": "quota", "sharedQuotaId": "shared-quota",
+            "acceleratorModel": "H20", "clusterId": "cluster",
+            "zoneId": "zone", "clusterDisplayName": "cluster-name",
+            "zoneDisplayName": "zone-name", "queueCategory": "QUEUE_CATEGORY_IDLE",
+        }
+        location = queue_location_info(queue)
+        assert location["queue_id"] == "shared-q"
+        assert location["shared_quota_id"] == "shared-quota"
+        assert location["queue_category"] == "QUEUE_CATEGORY_IDLE"
+
 
 class TestQueueLocationInfo:
     def test_extracts_fields(self):
@@ -368,8 +444,8 @@ class TestQueueLocationInfo:
         assert location["quota_id"] == "8273b556-2773-4ba3-8bef-a1bcdfdcd0c3"
         assert location["cluster_id"] == "cb363735-bf90-47c3-9d7f-49f4965cbb27"
         assert location["zone_id"] == "0922cfc7-8710-4c6d-9660-c9dd448ad1ac"
-        assert location["cluster_display_name"] == "北京上庄"
-        assert location["zone_display_name"] == "可用区A"
+        assert location["region_name"] == "北京上庄"
+        assert location["zone_name"] == "可用区A"
         assert location["accelerator_model"] == "J1_ADV_H1-SXM4-80GB"
         assert location["proj_id"] == "b121aae3-2198-4c91-9e72-355aa5a0e050"
 
@@ -668,3 +744,131 @@ class TestExperimentJobsProjsetFallback:
 
         with pytest.raises(ApiError, match="no joined projset"):
             api.experiment_jobs_all("eid-1")
+
+
+def _authed(*responses):
+    opener = FakeOpener(*responses)
+    api = PlatformAPI(opener=opener)
+    api._token = "tok"
+    return api, opener
+
+
+def _body(request):
+    return json.loads(request.data.decode())
+
+
+PROJSETS = {"items": [{"projsetInfo": {"id": "ps-1", "name": "baai-safety"}},
+                      {"projsetInfo": {"id": "ps-2", "name": "other"}}]}
+
+
+class TestSharedQueueEndpoints:
+    def test_list_shared_queues_unwraps_and_tags_category(self):
+        api, opener = _authed({"sharedQueues": [
+            {"queue": {"id": "q1", "name": "Public-Pool-A"}},
+            {"id": "q2", "name": "Public-Pool-B"},
+        ]})
+        rows = api.list_shared_queues(projset_id="ps-1", queue_category="idle")
+        assert [r["name"] for r in rows] == ["Public-Pool-A", "Public-Pool-B"]
+        assert all(r["queueCategory"] == "QUEUE_CATEGORY_IDLE" for r in rows)
+        body = _body(opener.requests[0])
+        assert body["queueCategory"] == "QUEUE_CATEGORY_IDLE"
+        assert body["projsetId"] == "ps-1"
+
+    def test_job_counts_default_projset_and_body(self):
+        api, opener = _authed(PROJSETS, {"items": [{"runningCount": 2}]})
+        rows = api.list_shared_queue_job_counts(queue_category="public")
+        assert rows == [{"runningCount": 2}]
+        body = _body(opener.requests[1])
+        assert body["projsetId"] == "ps-1"
+        assert body["queueCategory"] == "QUEUE_CATEGORY_PUBLIC"
+        assert body["onlyQueueing"] is False
+
+    def test_shared_queue_limits_parses_ints(self):
+        api, opener = _authed(PROJSETS, {"items": [
+            {"configKey": "max_jobs_per_projset", "configValue": "4"},
+            {"configKey": "note", "configValue": "text"},
+            {"configValue": "ignored"},
+        ]})
+        assert api.shared_queue_limits() == {"max_jobs_per_projset": 4, "note": "text"}
+        assert _body(opener.requests[1])["projsetId"] == "ps-1"
+
+    def test_find_queue_shared_uses_shared_list(self):
+        api, opener = _authed({"sharedQueues": [{"id": "q1", "name": "Public-Pool-A"}]})
+        queue = api.find_queue("Public-Pool-A", queue_category="public")
+        assert queue["id"] == "q1"
+        assert opener.requests[0].full_url.endswith("/api/v1/shared-queue/list")
+
+
+class TestResolveProjectContext:
+    def test_no_names(self):
+        api, opener = _authed()
+        assert api.resolve_project_context() == (None, None)
+        assert opener.requests == []
+
+    def test_project_set_name_only(self):
+        api, _ = _authed(PROJSETS)
+        assert api.resolve_project_context("baai-safety") == (None, "ps-1")
+
+    def test_unknown_project_set_lists_available(self):
+        api, _ = _authed(PROJSETS)
+        with pytest.raises(ValueError, match="available: baai-safety, other"):
+            api.resolve_project_context("nope")
+
+    def test_project_name_resolved_from_queue_rows(self):
+        api, _ = _authed(PROJSETS, {"queueSummaryInfos": [
+            {"name": "q", "projName": "research", "projsetName": "baai-safety",
+             "projId": "p-9", "projsetId": "ps-1"},
+        ]})
+        assert api.resolve_project_context("baai-safety", "research") == ("p-9", "ps-1")
+
+    def test_unknown_project_name_raises(self):
+        api, _ = _authed(PROJSETS, {"queueSummaryInfos": [
+            {"name": "q", "projName": "research", "projId": "p", "projsetId": "ps-1"}]})
+        with pytest.raises(ValueError, match="project_name 'nope' not found"):
+            api.resolve_project_context("baai-safety", "nope")
+
+
+class TestPlacementHelpers:
+    def test_list_category_queues_dispatch(self):
+        api, opener = _authed({"sharedQueues": [{"id": "q1", "name": "S"}]},
+                              {"queueSummaryInfos": [{"id": "d1", "name": "D"}]})
+        assert [q["name"] for q in api.list_category_queues("idle", projset_id="ps")] == ["S"]
+        assert [q["name"] for q in api.list_category_queues(None, projset_id="ps")] == ["D"]
+        assert opener.requests[0].full_url.endswith("/api/v1/shared-queue/list")
+        assert opener.requests[1].full_url.endswith("/queue/select")
+
+    def test_shared_queue_budgets(self):
+        api, opener = _authed(
+            {"items": [{"configKey": "max_jobs_per_projset", "configValue": "4"},
+                       {"configKey": "max_idle_jobs_per_projset", "configValue": "5"}]},
+            {"items": [{"runningCount": 2, "queueingCount": 1}, {"runningCount": 0}]},
+            {"items": [{"runningCount": 7}]},
+        )
+        assert api.shared_queue_budgets(projset_id="ps") == {
+            "QUEUE_CATEGORY_PUBLIC": 1, "QUEUE_CATEGORY_IDLE": 0}
+        assert _body(opener.requests[1])["queueCategory"] == "QUEUE_CATEGORY_PUBLIC"
+        assert _body(opener.requests[2])["queueCategory"] == "QUEUE_CATEGORY_IDLE"
+
+    def test_shared_queue_budgets_without_limits_are_unlimited(self):
+        api, opener = _authed({"items": []})
+        assert api.shared_queue_budgets(projset_id="ps") == {
+            "QUEUE_CATEGORY_PUBLIC": None, "QUEUE_CATEGORY_IDLE": None}
+        assert len(opener.requests) == 1  # no job-count calls needed
+
+    def test_filter_queues(self):
+        rows = [
+            {"name": "a", "projsetName": "ps", "projName": "p", "clusterDisplayName": "r1",
+             "zoneDisplayName": "z1"},
+            {"name": "b", "projsetName": "other", "projName": "p", "clusterDisplayName": "r1"},
+            {"name": "c", "projsetName": "ps", "projName": "p", "clusterDisplayName": "r2"},
+        ]
+        assert [q["name"] for q in filter_queues(rows, project_set_name="ps")] == ["a", "c"]
+        assert [q["name"] for q in filter_queues(rows, region_name="r1", zone_name="z1")] == ["a"]
+        # Shared pools carry no project names: project filters do not drop them.
+        shared = [{"name": "s", "clusterDisplayName": "r1"}]
+        assert filter_queues(shared, project_set_name="ps", project_name="p") == shared
+
+    def test_with_project_context_fills_only_missing(self):
+        queue = with_project_context({"projId": "own"}, "p1", "ps1", "proj", "set")
+        assert queue == {"projId": "own", "projsetId": "ps1", "projName": "proj",
+                         "projsetName": "set"}

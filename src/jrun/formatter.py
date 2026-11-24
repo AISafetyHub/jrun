@@ -2,7 +2,7 @@ import unicodedata
 
 import click
 
-from jrun.project import Project
+from jrun.project import build_job_url
 
 
 def display_width(text: str) -> int:
@@ -13,7 +13,30 @@ def display_width(text: str) -> int:
 
 def pad(text: str, width: int) -> str:
     """Left-pad-to-width aware of CJK display width."""
+    text = str(text)
     return text + " " * max(0, width - display_width(text))
+
+
+def rpad(text: str, width: int) -> str:
+    """Right-align text to a terminal display width."""
+    text = str(text)
+    return " " * max(0, width - display_width(text)) + text
+
+
+def truncate(text: str, width: int) -> str:
+    """Trim text without splitting the terminal width budget."""
+    text = str(text)
+    if display_width(text) <= width:
+        return text
+    result = []
+    used = 0
+    for char in text:
+        char_width = display_width(char)
+        if used + char_width > width:
+            break
+        result.append(char)
+        used += char_width
+    return "".join(result)
 
 
 def pct(value) -> str:
@@ -72,6 +95,7 @@ STATUS_COLORS = {
     "scheduling": "cyan",
     "queued": "bright_black",
     "submitted": "yellow",
+    "approving": "yellow",
     "failed": "red",
     "stopped": "magenta",
     "cancelled": "magenta",
@@ -82,7 +106,7 @@ STATUS_COLORS = {
 def colored_status(status: str, width: int = 0) -> str:
     """Status string padded to width and colored per STATUS_COLORS."""
     color = STATUS_COLORS.get(status.lower())
-    padded = f"{status:<{width}}" if width else status
+    padded = pad(status, width) if width else status
     if color:
         return click.style(padded, fg=color)
     return padded
@@ -113,18 +137,18 @@ def print_experiment_job_table(jobs: list[dict], job_urls: dict | None = None):
         for info in jobs
     ]
     name_w = max([display_width(r[0]) for r in rows] + [4]) + 2
-    status_w = max([len(r[1]) for r in rows] + [6]) + 2
+    status_w = max([display_width(r[1]) for r in rows] + [6]) + 2
     submitted_w = 20  # format_ms_long output is "YYYY-MM-DDTHH:MM:SS"
     queue_w = max([display_width(r[3]) for r in rows] + [5]) + 2
 
-    header = (f"{'NAME':<{name_w}} {'STATUS':<{status_w}} "
-              f"{'SUBMITTED':<{submitted_w}} {'QUEUE':<{queue_w}}")
+    header = (f"{pad('NAME', name_w)} {pad('STATUS', status_w)} "
+              f"{pad('SUBMITTED', submitted_w)} {pad('QUEUE', queue_w)}")
     header += " LINK" if has_links else " ID"
     click.echo(header)
-    click.echo("-" * len(header))
+    click.echo("-" * display_width(header))
     for name, status, submitted, queue, job_id in rows:
         line = (f"{pad(name, name_w)} {colored_status(status, status_w)} "
-                f"{submitted:<{submitted_w}} {pad(queue, queue_w)}")
+                f"{pad(submitted, submitted_w)} {pad(queue, queue_w)}")
         if has_links:
             url = job_urls.get(job_id)
             if url:
@@ -135,12 +159,7 @@ def print_experiment_job_table(jobs: list[dict], job_urls: dict | None = None):
 
 
 class StatusFormatter:
-    def __init__(self, project: Project):
-        self.project = project
-
-    @property
-    def has_links(self) -> bool:
-        return self.project.platform_ids is not None
+    """Tables for tracked jobs (`jrun job status`, post-submit summary)."""
 
     def colored_status(self, status: str, width: int) -> str:
         return colored_status(status, width)
@@ -154,28 +173,24 @@ class StatusFormatter:
             return
 
         urls = {
-            jid: self.project.build_job_url(
-                jid,
-                platform=info.get("platform"),
-                experiment_name=info.get("experiment_name"),
-            )
+            jid: build_job_url(jid, info.get("platform"), info.get("experiment_name"))
             for jid, info in jobs.items()
         }
         has_links = any(urls.values())
-        max_name_len = max(len(info['name']) for info in jobs.values())
-        max_status_len = max(len(info.get('status', '?')) for info in jobs.values())
+        max_name_len = max(display_width(info['name']) for info in jobs.values())
+        max_status_len = max(display_width(info.get('status', '?')) for info in jobs.values())
         name_width = max(max_name_len, 4) + 2
         status_width = max(max_status_len, 6) + 2
 
-        header = f"{'NAME':<{name_width}} {'STATUS':<{status_width}} {'SUBMITTED':<20}"
+        header = f"{pad('NAME', name_width)} {pad('STATUS', status_width)} {pad('SUBMITTED', 20)}"
         if has_links:
             header += " LINK"
         click.echo(header)
-        click.echo("-" * len(header))
+        click.echo("-" * display_width(header))
 
         for jid, info in jobs.items():
             status = info.get('status', '?')
-            line = f"{info['name']:<{name_width}} {self.colored_status(status, status_width)} {info.get('submitted_at', ''):<20}"
+            line = f"{pad(info['name'], name_width)} {self.colored_status(status, status_width)} {pad(info.get('submitted_at', ''), 20)}"
             url = urls[jid]
             if url:
                 line += f" {self.hyperlink(url, 'url')}"
@@ -188,22 +203,22 @@ class StatusFormatter:
         where row_type is "search" or "job".
         """
         has_links = any(job_urls.get(row[3]) for row in rows if row[3])
-        max_name_len = max(len(r[0]) for r in rows)
-        max_status_len = max(len(r[1]) for r in rows)
+        max_name_len = max(display_width(r[0]) for r in rows)
+        max_status_len = max(display_width(r[1]) for r in rows)
         name_width = max(max_name_len, 4) + 2
         status_width = max(max_status_len, 6) + 2
 
-        header = f"{'NAME':<{name_width}} {'STATUS':<{status_width}} {'SUBMITTED':<20}"
+        header = f"{pad('NAME', name_width)} {pad('STATUS', status_width)} {pad('SUBMITTED', 20)}"
         if has_links:
             header += " LINK"
         click.echo(header)
-        click.echo("-" * len(header))
+        click.echo("-" * display_width(header))
 
         for name, status_str, submitted_at, job_id, row_type in rows:
             if row_type == "search":
-                line = f"{name:<{name_width}} {status_str:<{status_width}} {submitted_at:<20}"
+                line = f"{pad(name, name_width)} {pad(status_str, status_width)} {pad(submitted_at, 20)}"
             else:
-                line = f"{name:<{name_width}} {self.colored_status(status_str, status_width)} {submitted_at:<20}"
+                line = f"{pad(name, name_width)} {self.colored_status(status_str, status_width)} {pad(submitted_at, 20)}"
                 if job_id:
                     url = job_urls.get(job_id)
                     if url:

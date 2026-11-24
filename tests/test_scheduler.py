@@ -1,12 +1,11 @@
 import os
-import signal
 import pytest
-from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-from jrun.models import Job
+from jrun.errors import ApiError
+from jrun.models import ACTIVE_STATUSES, TERMINAL_STATUSES, Job, ResourceConfig, RunOptions
 from jrun.project import Project
-from jrun.scheduler import Scheduler, TERMINAL_STATUSES, ACTIVE_STATUSES
+from jrun.scheduler import Scheduler
 
 
 @pytest.fixture
@@ -88,7 +87,7 @@ class TestConstants:
 
 class TestSchedulerSync:
     def test_run_loop_persists_job_platform(self, tmp_path):
-        project = Project.init("exp", experiment_id="eid-1", directory=tmp_path)
+        project = Project.init(directory=tmp_path)
         entries = [
             {"job_id": "j1", "name": "job-1", "params": {}},
         ]
@@ -131,7 +130,7 @@ class TestSchedulerSync:
     def test_pending_job_only_runs_existing_config_and_replaces_local_id(
         self, mock_sleep, tmp_path
     ):
-        project = Project.init("exp", experiment_id="eid-1", directory=tmp_path)
+        project = Project.init(directory=tmp_path)
         project.record_single_job("old-id", "pending-job")
         project.record_pending_jobs(
             "search", "config.yaml",
@@ -154,10 +153,123 @@ class TestSchedulerSync:
 
         scheduler.run_loop()
 
-        scheduler.platform.run_config.assert_called_once_with("eid-1", "pending-job")
-        scheduler.platform.submit_job.assert_not_called()
+        scheduler.platform.run_config.assert_called_once_with(
+            "eid-1", "pending-job", run_options=RunOptions(), queue_category=None,
+        )
         scheduler.platform.modify_configs.assert_not_called()
         tracker = project.load_tracker()
         assert "old-id" not in tracker["jobs"]
         assert tracker["jobs"]["new-id"]["name"] == "pending-job"
         assert tracker["searches"]["search"]["job_ids"] == ["new-id"]
+
+
+class TestSchedulerRunOptions:
+    @patch("jrun.scheduler.time.sleep")
+    def test_forwards_persisted_category_and_run_options(self, mock_sleep, tmp_path):
+        project = Project.init(directory=tmp_path)
+        options = RunOptions(duration_hours=2, usage_desc="u", queue_priority_mode="high")
+        project.record_pending_jobs(
+            "search", "config.yaml",
+            [Job(name="pub", run_options=options, resource_config=ResourceConfig(
+                queue_name="Public-Pool", queue_category="QUEUE_CATEGORY_PUBLIC"))],
+            experiment_id="eid-1",
+        )
+        scheduler = Scheduler(project.jrun_dir, "search", "exp", "eid-1", 1, 0)
+        scheduler.platform = MagicMock()
+        scheduler._api = MagicMock()
+        scheduler._api.resolve_project_context.return_value = ("p1", "ps1")
+        scheduler._api.shared_queue_budgets.return_value = {}  # unlimited
+        scheduler.platform.run_config.return_value = "new-id"
+        scheduler.platform.get_job_info.return_value = {"status": "Succeed"}
+        scheduler._log = MagicMock()
+
+        scheduler.run_loop()
+
+        scheduler.platform.run_config.assert_called_once_with(
+            "eid-1", "pub", run_options=options, queue_category="QUEUE_CATEGORY_PUBLIC",
+        )
+
+    @patch("jrun.scheduler.time.sleep")
+    def test_invalid_job_data_is_skipped_not_fatal(self, mock_sleep, tmp_path):
+        project = Project.init(directory=tmp_path)
+        ids = project.record_pending_jobs("search", "c.yaml", [{"name": "old"}])
+        with project._locked_tracker() as tracker:
+            tracker["jobs"][ids[0]]["job_data"]["resource_config"] = {"worker": {"replicas": 2}}
+        scheduler = Scheduler(project.jrun_dir, "search", "exp", "eid-1", 1, 0)
+        scheduler.platform = MagicMock()
+        scheduler._log = MagicMock()
+        # A job that can never be submitted keeps the loop alive; stop after one pass.
+        mock_sleep.side_effect = [None, KeyboardInterrupt]
+        with pytest.raises(KeyboardInterrupt):
+            scheduler.run_loop()
+        scheduler.platform.run_config.assert_not_called()
+        assert any("invalid job_data" in str(c) for c in scheduler._log.call_args_list)
+
+    def test_pid_management_needs_only_dir_and_name(self, tmp_path):
+        scheduler = Scheduler(tmp_path, "s")
+        assert scheduler.is_running() is None
+        assert scheduler.stop() is False
+
+
+class TestSchedulerSlots:
+    def _scheduler(self, project, parallel=0):
+        scheduler = Scheduler(project.jrun_dir, "search", "exp", "eid-1", parallel, 0)
+        scheduler.platform = MagicMock()
+        scheduler.platform.get_job_info.return_value = {"status": "Running"}
+        scheduler._log = MagicMock()
+        return scheduler
+
+    @staticmethod
+    def _shared(name, category="public"):
+        return Job(name=name, resource_config=ResourceConfig(
+            queue_name="Public-Pool", queue_category=category, project_set_name="ps"))
+
+    @patch("jrun.scheduler.time.sleep")
+    def test_zero_parallel_trials_means_unlimited(self, mock_sleep, tmp_path):
+        project = Project.init(directory=tmp_path)
+        project.record_pending_jobs("search", "c.yaml", [Job(name="a"), Job(name="b")],
+                                    experiment_id="eid-1")
+        scheduler = self._scheduler(project)
+        scheduler.platform.run_config.side_effect = ["id-a", "id-b"]
+        scheduler.platform.get_job_info.return_value = {"status": "Succeed"}
+        scheduler.run_loop()
+        assert scheduler.platform.run_config.call_count == 2
+
+    @patch("jrun.scheduler.PlatformAPI")
+    @patch("jrun.scheduler.time.sleep")
+    def test_shared_jobs_wait_for_submit_slots(self, mock_sleep, api_cls, tmp_path):
+        project = Project.init(directory=tmp_path)
+        project.record_pending_jobs(
+            "search", "c.yaml",
+            [self._shared("p1"), self._shared("p2"), self._shared("i1", "idle"),
+             Job(name="d1")],
+            experiment_id="eid-1")
+        api = api_cls.return_value
+        api.resolve_project_context.return_value = (None, "ps-1")
+        api.shared_queue_budgets.return_value = {"QUEUE_CATEGORY_PUBLIC": 1,
+                                                 "QUEUE_CATEGORY_IDLE": 0}
+        scheduler = self._scheduler(project)
+        scheduler.platform.run_config.side_effect = ["id-p1", "id-d1"]
+        mock_sleep.side_effect = [None, None, KeyboardInterrupt]  # one poll
+        with pytest.raises(KeyboardInterrupt):
+            scheduler.run_loop()
+        # One public slot: p1 runs, p2 waits; idle has none; dedicated d1 always runs.
+        assert [c.args[1] for c in scheduler.platform.run_config.call_args_list] == ["p1", "d1"]
+        api.shared_queue_budgets.assert_called_once_with(proj_id=None, projset_id="ps-1")
+        statuses = {info["name"]: info["status"]
+                    for info in project.load_tracker()["jobs"].values()}
+        assert statuses["p2"] == "Queued" and statuses["i1"] == "Queued"
+
+    @patch("jrun.scheduler.PlatformAPI")
+    @patch("jrun.scheduler.time.sleep")
+    def test_budget_read_failure_falls_back_to_trying(self, mock_sleep, api_cls, tmp_path):
+        project = Project.init(directory=tmp_path)
+        project.record_pending_jobs("search", "c.yaml", [self._shared("p1")],
+                                    experiment_id="eid-1")
+        api_cls.return_value.resolve_project_context.side_effect = ApiError("/x", 500, "down")
+        scheduler = self._scheduler(project)
+        scheduler.platform.run_config.return_value = "id-p1"
+        scheduler.platform.get_job_info.return_value = {"status": "Succeed"}
+        scheduler.run_loop()
+        scheduler.platform.run_config.assert_called_once()
+        assert any("trying anyway" in str(c) for c in scheduler._log.call_args_list)

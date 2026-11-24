@@ -11,29 +11,67 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from jrun.errors import PlatformError
-from jrun.models import Job
+from jrun.api import PlatformAPI
+from jrun.errors import ApiError, PlatformError
+from jrun.models import (ACTIVE_STATUSES, SHARED_CATEGORIES, TERMINAL_STATUSES, Job,
+                         normalize_queue_category)
 from jrun.platform import PlatformClient
 from jrun.project import Project
 
 
-TERMINAL_STATUSES = {"Completed", "Succeed", "Failed", "Stopped", "Cancelled"}
-ACTIVE_STATUSES = {"Submitted", "Running", "Pending", "Queued", "Starting", "Scheduling"}
-
-
 class Scheduler:
-    def __init__(self, jrun_dir: Path, search_name: str, exp_name: str | None,
-                 exp_id: str, parallel_trials: int, poll_interval: int,
-                 spec: dict | None = None, queue_locations: dict | None = None):
+    """Run-only daemon for one search's queued jobs.
+
+    All pending configs are installed by the submit command's single
+    experiment modify; the scheduler only calls ``job run`` for them as
+    slots free up. ``parallel_trials`` <= 0 means no concurrency limit.
+    Public/idle jobs additionally wait for a free per-projset submit slot
+    (read from the platform each poll). Constructing with just ``jrun_dir``
+    and ``search_name`` is enough for PID management (is_running/stop).
+    """
+
+    def __init__(self, jrun_dir: Path, search_name: str, exp_name: str | None = None,
+                 exp_id: str | None = None, parallel_trials: int = 0,
+                 poll_interval: int = 30):
         self.jrun_dir = jrun_dir
         self.search_name = search_name
         self.exp_name = exp_name
         self.exp_id = exp_id
         self.parallel_trials = parallel_trials
         self.poll_interval = poll_interval
-        self.spec = spec
-        self.queue_locations = queue_locations or {}
         self.platform = PlatformClient()
+        self._api: PlatformAPI | None = None
+
+    def _shared_slots(self, job: Job, cache: dict) -> int | None:
+        """Remaining public/idle submit slots for the job's mode, or None.
+
+        None means dedicated, unlimited, or unknown (the run is attempted and
+        a platform rejection keeps the job Queued). ``cache`` is per poll.
+        """
+        rc = job.resource_config
+        category = normalize_queue_category(rc.queue_category)
+        if category not in SHARED_CATEGORIES:
+            return None
+        key = (rc.project_set_name, rc.project_name)
+        if key not in cache:
+            try:
+                if self._api is None:
+                    self._api = PlatformAPI()
+                proj_id, projset_id = self._api.resolve_project_context(*key)
+                cache[key] = self._api.shared_queue_budgets(proj_id=proj_id,
+                                                            projset_id=projset_id)
+            except (ApiError, ValueError) as e:
+                self._log(f"  Cannot read public/idle submit slots ({e}); trying anyway")
+                cache[key] = {}
+        return cache[key].get(category)
+
+    @staticmethod
+    def _use_shared_slot(job: Job, cache: dict):
+        rc = job.resource_config
+        budgets = cache.get((rc.project_set_name, rc.project_name)) or {}
+        category = normalize_queue_category(rc.queue_category)
+        if budgets.get(category) is not None:
+            budgets[category] -= 1
 
     @property
     def _scheduler_dir(self) -> Path:
@@ -87,8 +125,6 @@ class Scheduler:
             "exp_id": self.exp_id,
             "parallel_trials": self.parallel_trials,
             "poll_interval": self.poll_interval,
-            "spec": self.spec,
-            "queue_locations": self.queue_locations,
             "pending_jobs": pending_dicts,
         }, indent=2))
 
@@ -148,14 +184,20 @@ class Scheduler:
                 if status in ACTIVE_STATUSES:
                     active_count += 1
 
-            slots = max(0, self.parallel_trials - active_count)
-            to_submit = queued_ids[:slots]
+            if self.parallel_trials and self.parallel_trials > 0:
+                slots = max(0, self.parallel_trials - active_count)
+            else:
+                slots = len(queued_ids)
 
-            if to_submit:
-                self._log(f"Active: {active_count}, Queued: {len(queued_ids)}, Submitting: {len(to_submit)}")
+            if queued_ids and slots:
+                self._log(f"Active: {active_count}, Queued: {len(queued_ids)}, Slots: {slots}")
 
             consecutive_failures = 0
-            for queued_id in to_submit:
+            started = 0
+            budget_cache: dict = {}
+            for queued_id in queued_ids:
+                if started >= slots:
+                    break
                 with project._locked_tracker() as tr:
                     job_info = tr["jobs"].get(queued_id)
                     if not job_info or job_info["status"] != "Queued":
@@ -164,28 +206,28 @@ class Scheduler:
                     job_name = job_info["name"]
                     job_params = job_info.get("params", {})
 
-                if not job_data.get("name"):
-                    self._log(f"Skipping {queued_id}: missing job_data")
+                try:
+                    pending_job = Job.from_dict(job_data)
+                except ValueError as e:
+                    self._log(f"Skipping {queued_id}: invalid job_data ({e})")
                     continue
+
+                remaining = self._shared_slots(pending_job, budget_cache)
+                if remaining is not None and remaining <= 0:
+                    continue  # no public/idle submit slot; retry next poll
 
                 self._log(f"Submitting: {job_name}")
 
                 real_job_id = None
                 for attempt in range(3):
                     try:
-                        # All pending configs were installed by the submit
-                        # command's one batch modify.  Scheduler turns a
-                        # config into a job only; it must never modify the
-                        # experiment again.
-                        candidate_id = self.platform.run_config(
-                            self.exp_id, job_name
+                        # The submit command persisted the effective queue
+                        # category into job_data for exactly this call.
+                        real_job_id = self.platform.run_config(
+                            self.exp_id, job_name,
+                            run_options=pending_job.run_options,
+                            queue_category=pending_job.resource_config.queue_category,
                         )
-                        if not isinstance(candidate_id, str) or not candidate_id:
-                            raise PlatformError(
-                                "job run", 1,
-                                stderr="platform returned no job ID",
-                            )
-                        real_job_id = candidate_id
                         break
                     except PlatformError as e:
                         self._log(f"  Submit error: {e}")
@@ -197,6 +239,8 @@ class Scheduler:
                 with project._locked_tracker() as tr:
                     if real_job_id:
                         consecutive_failures = 0
+                        started += 1
+                        self._use_shared_slot(pending_job, budget_cache)
                         self._log(f"Submitted: {job_name} -> {real_job_id[:8]}")
                         tr["jobs"][real_job_id] = {
                             "name": job_name,
@@ -210,9 +254,9 @@ class Scheduler:
                         tr["jobs"].pop(queued_id, None)
                         replacement_id = job_info.get("replace_job_id")
                         if replacement_id and replacement_id != real_job_id:
-                            # An overwrite replaces only the local name -> ID
-                            # mapping after the new run succeeds.  The old
-                            # platform job is intentionally left untouched.
+                            # The old run was already stopped at submit time;
+                            # drop its local mapping now that the replacement
+                            # has started.
                             tr["jobs"].pop(replacement_id, None)
                             for other_search in tr.get("searches", {}).values():
                                 other_search["job_ids"] = [
@@ -284,7 +328,5 @@ if __name__ == "__main__":
         exp_id=args["exp_id"],
         parallel_trials=args["parallel_trials"],
         poll_interval=args["poll_interval"],
-        spec=args.get("spec"),
-        queue_locations=args.get("queue_locations"),
     )
     scheduler.run_loop()

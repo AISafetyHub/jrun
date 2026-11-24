@@ -6,39 +6,48 @@ messages are injected as callbacks by the command layer, so this module can be
 unit-tested directly.
 """
 
-import json
 import subprocess
-from contextlib import contextmanager
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from jrun.api import PlatformAPI, queue_location_info
-from jrun.config import ConfigLoader
 from jrun.errors import ApiError, ConfigError, PlatformError
-from jrun.models import ExperimentSpec, Job, effective_spec, job_runtime
+from jrun.models import (DEFAULT_IMAGE_REGION, SHARED_CATEGORIES, ExperimentSpec,
+                         Job, JobTarget, TERMINAL_STATUSES, job_target,
+                         queue_category_alias, validate_job)
+from jrun.placement import Placement, is_auto_job, place_auto_jobs
 from jrun.platform import PlatformClient
 from jrun.project import Project
-from jrun.scheduler import Scheduler, TERMINAL_STATUSES
-from jrun.tracking import refresh_active_statuses
+from jrun.scheduler import Scheduler
+from jrun.tracking import is_queued_id, plain_progress, release_job
 
-
-@contextmanager
-def _plain_progress(items, label="", **kwargs):
-    """Default progress display: no bar, just iterate."""
-    yield items
+CONFIG_COUNT_WARNING = 100
 
 
 @dataclass
 class ResolvedExperiment:
-    name: str | None
-    id: str | None
-    queue_locations: dict = field(default_factory=dict)  # queue name -> location
-    spec: ExperimentSpec | None = None
-    config_count: int | None = None
-    # The exact snapshot used for the config-count warning and subsequent
-    # full replacement.  Keeping it here prevents a second experiment list
-    # request during the same submit operation.
-    experiment_data: dict | list | None = None
+    spec: ExperimentSpec | None
+    id: str | None = None
+    queue_locations: dict = field(default_factory=dict)  # JobTarget.location_key -> location
+    # The experiment detail read once per submit: used for the config-count
+    # warning and as the template for the single full-replacement modify.
+    experiment_data: dict | None = None
+    # Auto-placement result (queue_name: auto jobs); None when there were none.
+    placement: Placement | None = None
+
+    @property
+    def deferred(self) -> set[str]:
+        """Jobs that must wait for a public/idle submit slot."""
+        return self.placement.deferred if self.placement else set()
+
+    @property
+    def name(self) -> str | None:
+        return self.spec.name if self.spec else None
+
+    @property
+    def config_count(self) -> int | None:
+        if self.experiment_data is None:
+            return None
+        return len(PlatformClient.experiment_configs(self.experiment_data))
 
 
 @dataclass
@@ -55,188 +64,171 @@ class SubmitResult:
     scheduler_pid: int | None = None
 
 
-def _lookup_queue(api: PlatformAPI, queue_name: str,
-                  spec: ExperimentSpec | None) -> dict:
-    """Find a queue by name, with an informative error listing the options."""
-    proj_id = spec.proj_id if spec else None
-    projset_id = spec.projset_id if spec else None
-    queue = api.find_queue(queue_name, proj_id=proj_id, projset_id=projset_id)
-    if not queue:
-        available = ", ".join(
-            sorted(q.get("name", "") for q in api.list_queues(proj_id=proj_id,
-                                                              projset_id=projset_id))
+# --- queues & experiments ---------------------------------------------------
+
+def find_queue(api: PlatformAPI, target: JobTarget) -> dict:
+    """Resolve a job target's named queue to its platform row.
+
+    Raises ConfigError when the queue is ambiguous or not found (listing the
+    queues that are available in that category).
+    """
+    try:
+        queue = api.find_queue(
+            target.queue_name, queue_category=target.category,
+            project_set_name=target.project_set_name,
+            project_name=target.project_name,
+            region_name=target.region_name, zone_name=target.zone_name,
         )
-        raise ApiError(
-            "/api/v1/queue/select",
-            message=f"queue '{queue_name}' not found. Available queues: {available}",
-        )
-    return queue
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    if queue:
+        return queue
+    if target.category in SHARED_CATEGORIES:
+        candidates = api.list_shared_queues(queue_category=target.category)
+    else:
+        candidates = api.list_queues()
+    available = ", ".join(sorted({q.get("name", "") for q in candidates})) or "(none)"
+    raise ConfigError(
+        f"{queue_category_alias(target.category)} queue '{target.queue_name}' "
+        f"not found. Available: {available}"
+    )
 
 
 def resolve_queue_locations(api: PlatformAPI, jobs: list[Job],
-                            spec: ExperimentSpec | None) -> dict:
-    """Resolve queue/select location info for each distinct effective queue.
+                            spec: ExperimentSpec | None,
+                            known_queues: dict | None = None) -> dict:
+    """Resolve each distinct effective queue once; keyed by location_key.
 
-    Returns {queue_name: location}. Explicit cluster_id/zone_id in the spec
-    override the queue lookup.
+    ``known_queues`` (location_key -> queue row, from auto placement) skips
+    the lookup for queues that were already read.
     """
+    known_queues = known_queues or {}
     locations: dict[str, dict] = {}
     for job in jobs:
-        _, _, queue_name = job_runtime(job, spec)
-        if not queue_name or queue_name in locations:
+        target = job_target(job, spec)
+        if not target.queue_name or target.location_key in locations:
             continue
-        location = queue_location_info(
-            _lookup_queue(api, queue_name, spec))
-        if spec and spec.cluster_id:
-            location["cluster_id"] = spec.cluster_id
-        if spec and spec.zone_id:
-            location["zone_id"] = spec.zone_id
-        locations[queue_name] = location
+        queue = known_queues.get(target.location_key) or find_queue(api, target)
+        location = queue_location_info(queue)
+        location["queue_category"] = target.category
+        for key in ("project_set_name", "project_name", "region_name", "zone_name"):
+            location[key] = location.get(key) or getattr(target, key) or ""
+        locations[target.location_key] = location
     return locations
 
 
 def ensure_experiment(spec: ExperimentSpec, platform: PlatformClient,
-                      api: PlatformAPI, assume_yes: bool = False, *,
-                      confirm, echo=print, image: str | None = None,
-                      image_region: str | None = None,
-                      queue_name: str | None = None) -> str:
+                      api: PlatformAPI, target: JobTarget, *,
+                      assume_yes: bool = False, confirm, echo=print) -> str:
     """Look up the experiment named by spec; create it via the API if missing.
 
-    The creation placeholder config needs an image and a queue: taken from the
-    job-level arguments first, then from the deprecated spec fields.
-    Returns experiment_id.
+    ``target`` (usually the first job's) supplies the image and queue for the
+    creation placeholder config. Returns experiment_id.
     """
-    exp_id = None
-    result = platform.experiment_list(exp_name=spec.name, check=False)
-    if getattr(result, "returncode", 1) == 0 and getattr(result, "stdout", ""):
-        try:
-            experiment_data = json.loads(result.stdout)
-            exp_id = PlatformClient._experiment_id_from_data(experiment_data)
-            # A detail response already contains the exact template needed
-            # later in this submit.  Cache it so resolving the count does not
-            # perform a second `experiment list` call.
-            document = PlatformClient._experiment_document(experiment_data)
-            if exp_id and document:
-                cache = getattr(platform, "_experiment_cache", None)
-                if isinstance(cache, dict):
-                    cache[exp_id] = document
-        except (json.JSONDecodeError, TypeError):
-            pass
-    if exp_id:
-        echo(f"Experiment '{spec.name}' exists (id={exp_id})")
-        return exp_id
+    existing = platform.find_experiment(spec.name)
+    if existing:
+        echo(f"Experiment '{spec.name}' exists (id={existing['experiment_id']})")
+        return existing["experiment_id"]
 
-    image = image or spec.image
-    image_region = image_region or spec.image_region
-    queue_name = queue_name or spec.queue_name
-    if not image or not queue_name:
+    if not target.image or not target.queue_name:
         raise ConfigError(
             f"cannot create experiment '{spec.name}': no image/queue configured. "
-            f"Set image: and resource_config.queue_name: at job level."
+            "Set image: and resource_config.queue_name: (plus optional "
+            "project_set_name/project_name/region_name/zone_name) at job or "
+            "experiment level."
         )
-
-    queue = _lookup_queue(api, queue_name, spec)
-
+    queue = find_queue(api, target)
     if not assume_yes and not confirm(
         f"Experiment '{spec.name}' not found. Create it "
-        f"(queue={queue_name}, image={image})?",
+        f"(queue={target.queue_name}, image={target.image})?",
         default=True,
     ):
         raise ConfigError("Aborted: experiment creation declined.")
-    queue_location = queue_location_info(queue)
+    location = queue_location_info(queue)
     exp_id = api.create_experiment(
         name=spec.name,
         queue=queue,
-        image=image,
-        proj_id=spec.proj_id or queue_location["proj_id"],
-        projset_id=spec.projset_id or queue_location["projset_id"],
+        image=target.image,
+        proj_id=location["proj_id"],
+        projset_id=location["projset_id"],
         description=spec.description or "",
-        image_region=image_region,
+        image_region=target.image_region or DEFAULT_IMAGE_REGION,
+        queue_category=target.category,
+        train_frame=spec.train_frame or "PyTorch",
+        restart_policy=spec.restart_policy or "Never",
+        storage_info=spec.storage_info,
+        platform_overrides=spec.platform_overrides,
     )
     echo(f"Created experiment '{spec.name}' (id={exp_id})")
     return exp_id
 
 
-def resolve_experiment(loader: ConfigLoader, project: Project,
-                       platform: PlatformClient, api: PlatformAPI | None,
-                       spec: ExperimentSpec | None, dry_run: bool,
-                       assume_yes: bool, *, jobs: list[Job] | None = None,
+def validate_jobs(jobs: list[Job], spec: ExperimentSpec | None):
+    """Check each job's effective queue settings and run_options (no API)."""
+    for job in jobs:
+        try:
+            validate_job(job, spec)
+        except ValueError as exc:
+            raise ConfigError(f"job '{job.name}': {exc}") from exc
+
+
+def has_auto_jobs(jobs: list[Job], spec: ExperimentSpec | None) -> bool:
+    return any(is_auto_job(j, spec) for j in jobs)
+
+
+def resolve_experiment(platform: PlatformClient, api: PlatformAPI | None,
+                       spec: ExperimentSpec | None, jobs: list[Job], *,
+                       dry_run: bool, assume_yes: bool = False,
                        confirm, echo=print) -> ResolvedExperiment:
-    """Resolve the target experiment from the config's experiment: block
-    (creating it if missing) or the legacy experiment_id/name settings.
+    """Find or create the experiment from the config's ``experiment:`` block.
 
-    Also resolves queue locations for every distinct effective job queue.
-    Raises ConfigError when no experiment can be determined.
+    ``jobs`` are the jobs about to be submitted. ``queue_name: auto`` jobs are
+    placed first (rewritten into concrete jobs), so the experiment can be
+    created from a real queue. Then queue locations are resolved for every
+    distinct effective job queue and the experiment detail is read once.
+
+    In dry-run mode nothing is created; auto jobs are still placed when an
+    API client is given (read-only queries), and an API failure only warns.
     """
-    queue_locations: dict = {}
-    if spec and (spec.image or spec.queue_name
-                 or spec.image_region != ExperimentSpec.DEFAULT_IMAGE_REGION):
-        echo("Warning: experiment.image/image_region/queue_name are deprecated; "
-             "set image/image_region at job level and the queue via "
-             "resource_config.queue_name.")
-
-    if spec and not dry_run:
-        image, region, queue_name = job_runtime(jobs[0], spec) if jobs else (None, None, None)
-        exp_id = ensure_experiment(spec, platform, api, assume_yes=assume_yes,
-                                   confirm=confirm, echo=echo,
-                                   image=image, image_region=region,
-                                   queue_name=queue_name)
-        exp_name = spec.name
-    else:
-        exp_name = ((spec.name if spec else None)
-                    or loader.get_experiment_name() or project.experiment_name)
-        exp_id = loader.get_experiment_id() or project.experiment_id
-
-    if not dry_run and not exp_id:
-        raise ConfigError("no experiment. Add an 'experiment' section to the config, "
-                          "or set experiment_id.")
-
-    config_count = None
-    experiment_data = None
-    if not dry_run:
-        if jobs and any(job_runtime(j, spec)[2] for j in jobs):
-            if api is None:
-                raise ConfigError(
-                    "resolving resource_config.queue_name requires platform API "
-                    "credentials (run 'jrun login')."
-                )
-            queue_locations = resolve_queue_locations(api, jobs, spec)
-        # Fetch the required template once, derive the count from the same
-        # response, and carry the snapshot into modify_configs.  This makes a
-        # successful submit issue exactly one experiment detail request.
-        getter = getattr(platform, "get_experiment", None)
-        if callable(getter):
+    validate_jobs(jobs, spec)
+    if dry_run:
+        placement = None
+        if api is not None and has_auto_jobs(jobs, spec):
             try:
-                candidate = getter(exp_id, check=True)
-            except TypeError:
-                candidate = getter(exp_id)
-            if isinstance(candidate, (dict, list)):
-                experiment_data = candidate
-                config_count = len(PlatformClient._experiment_configs(candidate))
+                placement, _ = place_auto_jobs(api, jobs, spec)
+            except ApiError as e:
+                echo(f"Warning: cannot read queue capacity for auto placement: {e}")
+        return ResolvedExperiment(spec, placement=placement)
+    if spec is None:
+        raise ConfigError(
+            "config has no 'experiment:' section; add one with at least 'name:'."
+        )
+    if api is None:
+        raise ConfigError("submitting requires platform API credentials (run 'jrun login').")
 
-        # Compatibility for older PlatformClient-like adapters and loose test
-        # doubles that expose only the pre-split count method.
-        if experiment_data is None:
-            counter = getattr(platform, "count_experiment_configs", None)
-            if callable(counter):
-                counted = counter(exp_id)
-                config_count = counted if isinstance(counted, int) else None
-
-    return ResolvedExperiment(
-        exp_name, exp_id, queue_locations, spec, config_count,
-        experiment_data,
-    )
+    placement, known_queues = place_auto_jobs(api, jobs, spec)
+    exp_id = ensure_experiment(spec, platform, api, job_target(jobs[0], spec),
+                               assume_yes=assume_yes, confirm=confirm, echo=echo)
+    queue_locations = resolve_queue_locations(api, jobs, spec, known_queues)
+    experiment_data = platform.get_experiment(exp_id, check=True)
+    return ResolvedExperiment(spec, exp_id, queue_locations, experiment_data,
+                              placement=placement if placement.assignments else None)
 
 
-def run_local(job: Job, *, echo=print, err_echo=None):
-    """Run a job's command locally (queue_name: local)."""
+# --- local runs ---------------------------------------------------------------
+
+def run_local(job: Job, *, echo=print, err_echo=None) -> int:
+    """Run a job's command locally (queue_name: local). Returns the exit code."""
     err_echo = err_echo or echo
     echo(f"[local] {job.name}")
     echo(f"  $ {job.command}")
     result = subprocess.run(job.command, shell=True)
     if result.returncode != 0:
         err_echo(f"  Exit code: {result.returncode}")
+    return result.returncode
 
+
+# --- submission -----------------------------------------------------------------
 
 def classify_jobs(jobs: list[Job], find_existing, overwrite: bool,
                   status_filter, *, choose) -> JobClassification:
@@ -266,161 +258,151 @@ def classify_jobs(jobs: list[Job], find_existing, overwrite: bool,
     return result
 
 
-def teardown_overwrites(project: Project, platform: PlatformClient,
-                        overwrite_jobs: list, exp_id: str | None, *,
-                        echo=print, progress=_plain_progress):
-    """Deprecated compatibility hook.
+def _run_one(platform: PlatformClient, job: Job, exp_id: str) -> str:
+    """Start one config that was already installed by modify_configs."""
+    return platform.run_config(
+        exp_id, job.name, run_options=job.run_options,
+        queue_category=job.resource_config.queue_category,
+    )
 
-    Submits now replace the experiment config list in one operation and never
-    stop/cancel jobs as part of overwrite.  The old local mapping is removed
-    only after its replacement has successfully started, so this legacy hook
-    intentionally does nothing.
+
+def _run_all(platform: PlatformClient, jobs, exp_id: str, err_echo) -> dict[str, str]:
+    """Run each job; per-job failures are reported and skipped. name -> job_id."""
+    started = {}
+    for job in jobs:
+        try:
+            started[job.name] = _run_one(platform, job, exp_id)
+        except PlatformError as e:
+            err_echo(f"\n  {job.name}: Error: {e}")
+    return started
+
+
+def _install(platform: PlatformClient, resolved: ResolvedExperiment, jobs: list[Job]):
+    """Install exactly ``jobs`` as the experiment's config set (one modify).
+
+    The effective queue category and project names are persisted on each job
+    first, so the background scheduler passes the same public/idle mode to
+    ``job run`` and checks submit slots in the right project set.
     """
-    return None
+    for job in jobs:
+        target = job_target(job, resolved.spec)
+        rc = job.resource_config
+        rc.queue_category = target.queue_category
+        rc.project_set_name = target.project_set_name
+        rc.project_name = target.project_name
+    platform.modify_configs(jobs, resolved.id, spec=resolved.spec,
+                            queue_locations=resolved.queue_locations,
+                            experiment_data=resolved.experiment_data)
 
 
-def _submit_one(platform: PlatformClient, job: Job, exp_name: str | None,
-                exp_id: str | None, spec: ExperimentSpec | None,
-                queue_locations: dict) -> str:
-    """Run one config that was already installed by ``modify_configs``."""
-    run_config = getattr(platform, "run_config", None)
-    if not callable(run_config):
-        raise PlatformError(
-            "job run", 1,
-            stderr="platform client has no run_config method",
-        )
-
-    job_id = run_config(exp_id, job.name)
-    if isinstance(job_id, str) and job_id:
-        return job_id
-    raise PlatformError("job run", 1, stderr="platform returned no job ID")
-
-
-def _modify_batch(platform: PlatformClient, jobs: list[Job], exp_id: str | None,
-                  spec: ExperimentSpec | None, queue_locations: dict,
-                  experiment_data: dict | list | None):
-    """Install the complete current working set in one modify call."""
-    modify = getattr(platform, "modify_configs", None)
-    if not callable(modify):
-        raise PlatformError(
-            "experiment modify", 1,
-            stderr="platform client has no modify_configs method",
-        )
-    return modify(jobs, exp_id, spec=spec, queue_locations=queue_locations,
-                  experiment_data=experiment_data)
-
-
-def _remove_replaced_ids(project: Project, replacements: dict[str, str],
-                         successful_names: set[str],
-                         successful_ids: dict[str, str] | None = None):
+def _drop_replaced(project: Project, replacements: dict[str, str],
+                   started: dict[str, str]):
     """Drop old local IDs only for replacements that actually started."""
-    successful_ids = successful_ids or {}
-    for name in successful_names:
+    for name, new_id in started.items():
         old_id = replacements.get(name)
-        if old_id and old_id != successful_ids.get(name):
+        if old_id and old_id != new_id:
             project.remove_job(old_id)
 
 
 def submit_jobs(project: Project, platform: PlatformClient,
-                search_name: str, config_file: str, submit_list: list[Job],
-                exp_name: str | None, exp_id: str | None,
-                spec: ExperimentSpec | None, queue_locations: dict,
-                sched_params: dict, *,
-                echo=print, err_echo=None, progress=_plain_progress,
+                resolved: ResolvedExperiment, search_name: str, config_file: str,
+                jobs: list[Job], sched_params: dict, *,
                 replacements: dict[str, str] | None = None,
-                experiment_data: dict | list | None = None) -> SubmitResult:
-    """Replace configs once, then run each selected job.
+                echo=print, err_echo=None, progress=plain_progress) -> SubmitResult:
+    """Stop replaced jobs, install the configs once, then run each job.
 
-    ``experiment_data`` is the snapshot returned by ``resolve_experiment``.
-    Passing it through makes the whole submit use one experiment read.  A
-    modify failure is fatal before any run or tracker write; individual run
-    failures are reported while the remaining jobs continue.
+    ``replacements`` maps a job name to the old tracked ID it overwrites. The
+    old job is stopped first; if that fails, the job is skipped (reported via
+    ``err_echo``) so two runs never compete. A modify failure is fatal before
+    any run or tracker write; individual run failures are reported while the
+    remaining jobs continue.
     """
     err_echo = err_echo or echo
     replacements = replacements or {}
-    if not submit_list:
-        return SubmitResult([])
 
-    # The experiment is the current submission working set, not an append
-    # only history.  Do this exactly once, before starting any job.
-    _modify_batch(platform, submit_list, exp_id, spec, queue_locations,
-                  experiment_data)
+    tracked = project.load_tracker().get("jobs", {})
+    selected = []
+    for job in jobs:
+        old_id = replacements.get(job.name)
+        if old_id:
+            try:
+                release_job(project, platform, old_id, tracked.get(old_id, {}))
+            except PlatformError as e:
+                err_echo(f"  {job.name}: could not stop old job {old_id[:8]}, "
+                         f"skipped: {e}")
+                continue
+        selected.append(job)
+    if not selected:
+        return SubmitResult()
 
-    parallel = sched_params["parallel_trials"]
+    _install(platform, resolved, selected)
 
-    if parallel and parallel < len(submit_list):
-        immediate = submit_list[:parallel]
-        pending = submit_list[parallel:]
-
-        job_entries = []
+    # Jobs placed with no public/idle submit slot left go straight to the
+    # scheduler, which starts them once a slot frees up.
+    deferred = resolved.deferred
+    ready = [j for j in selected if j.name not in deferred]
+    waiting = [j for j in selected if j.name in deferred]
+    parallel = sched_params.get("parallel_trials")
+    if parallel and parallel < len(ready):
+        immediate, pending = ready[:parallel], ready[parallel:]
         echo(f"Submitting first {len(immediate)} jobs (parallel_trials={parallel})...")
-        successful_names = set()
-        successful_ids = {}
-        for j in immediate:
-            try:
-                job_id = _submit_one(platform, j, exp_name, exp_id, spec, queue_locations)
-                job_entries.append({"job_id": job_id, "name": j.name, "params": j.params})
-                successful_names.add(j.name)
-                successful_ids[j.name] = job_id
-            except PlatformError as e:
-                err_echo(f"  {j.name}: Error: {e}")
+    else:
+        immediate, pending = ready, []
+    if waiting:
+        echo(f"{len(waiting)} jobs wait for a public/idle submit slot (scheduler).")
+    pending += waiting
 
-        project.record_search(search_name, config_file, job_entries,
-                              experiment_id=exp_id, experiment_name=exp_name)
-        pending_dicts = [j.to_dict() for j in pending]
-        project.record_pending_jobs(search_name, config_file, pending_dicts,
-                                    experiment_id=exp_id, experiment_name=exp_name,
-                                    replacement_ids={
-                                        j.name: replacements[j.name]
-                                        for j in pending if j.name in replacements
-                                    })
-        _remove_replaced_ids(project, replacements, successful_names, successful_ids)
-
-        scheduler = Scheduler(
-            project.jrun_dir, search_name, exp_name, exp_id,
-            parallel, sched_params["poll_interval"],
-        )
-        pid = scheduler.start(pending_dicts)
-        echo(f"Submitted {len(job_entries)} jobs, {len(pending)} queued")
-        echo(f"Scheduler daemon started (pid={pid}, poll={sched_params['poll_interval']}s)")
-        echo(f"  Log: {project.jrun_dir / 'scheduler' / f'{search_name}.log'}")
-        return SubmitResult(job_entries, pending=len(pending), scheduler_pid=pid)
-
-    job_entries = []
-    successful_names = set()
-    successful_ids = {}
-    with progress(submit_list, label="Submitting",
+    with progress(immediate, label="Submitting",
                   item_show_func=lambda j: j.name if j else "") as bar:
-        for j in bar:
-            try:
-                job_id = _submit_one(platform, j, exp_name, exp_id, spec, queue_locations)
-                job_entries.append({"job_id": job_id, "name": j.name, "params": j.params})
-                successful_names.add(j.name)
-                successful_ids[j.name] = job_id
-            except PlatformError as e:
-                err_echo(f"\n  {j.name}: Error: {e}")
-    project.record_search(search_name, config_file, job_entries,
-                          experiment_id=exp_id, experiment_name=exp_name)
-    _remove_replaced_ids(project, replacements, successful_names, successful_ids)
-    echo(f"\nSubmitted {len(job_entries)} jobs under search '{search_name}'")
-    return SubmitResult(job_entries)
+        started = _run_all(platform, bar, resolved.id, err_echo)
+    entries = [{"job_id": started[j.name], "name": j.name, "params": j.params}
+               for j in immediate if j.name in started]
+    project.record_search(search_name, config_file, entries,
+                          experiment_id=resolved.id, experiment_name=resolved.name)
+    _drop_replaced(project, replacements, started)
+
+    if not pending:
+        echo(f"\nSubmitted {len(entries)} jobs under search '{search_name}'")
+        return SubmitResult(entries)
+
+    pending_dicts = [j.to_dict() for j in pending]
+    project.record_pending_jobs(
+        search_name, config_file, pending_dicts,
+        experiment_id=resolved.id, experiment_name=resolved.name,
+        replacement_ids={j.name: replacements[j.name]
+                         for j in pending if j.name in replacements},
+    )
+    poll = sched_params.get("poll_interval", 30)
+    scheduler = Scheduler(project.jrun_dir, search_name, resolved.name,
+                          resolved.id, parallel or 0, poll)
+    pid = scheduler.start(pending_dicts)
+    echo(f"Submitted {len(entries)} jobs, {len(pending)} queued")
+    echo(f"Scheduler daemon started (pid={pid}, poll={poll}s)")
+    echo(f"  Log: {project.jrun_dir / 'scheduler' / f'{search_name}.log'}")
+    return SubmitResult(entries, pending=len(pending), scheduler_pid=pid)
 
 
-def submit_single(project: Project, platform: PlatformClient, job: Job,
-                  exp_name: str | None, exp_id: str | None,
-                  spec: ExperimentSpec | None, queue_locations: dict,
-                  overwrite: bool, status_filter, *,
-                  confirm, choose, echo=print,
-                  experiment_data: dict | list | None = None) -> str | None:
+def submit_single(project: Project, platform: PlatformClient,
+                  resolved: ResolvedExperiment, job: Job, *,
+                  overwrite: bool, status_filter, confirm, choose,
+                  echo=print) -> str | None:
     """Submit a single job, handling existing-name overwrite/skip.
 
-    Returns the new job ID, or None when skipped/aborted.
+    Returns the new job ID, or None when skipped/aborted. Raises
+    PlatformError when the old job cannot be stopped or the submit fails, and
+    ConfigError when an auto job found no public/idle submit slot.
     choose: (job, old_id, old_status) -> bool — interactive overwrite decision.
     """
+    if job.name in resolved.deferred:
+        raise ConfigError(
+            f"job '{job.name}': no public/idle submit slot left for this project "
+            "set (see RUN/LIMIT in 'jrun queues'); add dedicated to "
+            "queue_category or submit again when a job finishes."
+        )
     existing = project.find_job_by_name(job.name)
     if existing:
         old_id, old_info = existing
-        if not old_id.startswith("queued-") and old_info.get("status") not in TERMINAL_STATUSES:
+        if not is_queued_id(old_id) and old_info.get("status") not in TERMINAL_STATUSES:
             new_status = platform.get_job_status(old_id)
             if new_status:
                 old_info["status"] = new_status
@@ -439,15 +421,15 @@ def submit_single(project: Project, platform: PlatformClient, job: Job,
             if not choose(job, old_id, old_status):
                 echo("Skipped.")
                 return None
+        release_job(project, platform, old_id, old_info)
+
     echo(f"Submitting {job.name}...")
-    # Install the one-job working set first.  The previous local mapping is
-    # deliberately untouched until both modify and run succeed.
-    _modify_batch(platform, [job], exp_id, spec, queue_locations,
-                  experiment_data)
-    job_id = _submit_one(platform, job, exp_name, exp_id, spec, queue_locations)
-    project.record_single_job(job_id, job.name,
-                              experiment_id=exp_id, experiment_name=exp_name)
-    if existing and old_id != job_id:
-        project.remove_job(old_id)
+    # The previous local mapping stays until both modify and run succeed.
+    _install(platform, resolved, [job])
+    job_id = _run_one(platform, job, resolved.id)
+    project.record_single_job(job_id, job.name, experiment_id=resolved.id,
+                              experiment_name=resolved.name)
+    if existing and existing[0] != job_id:
+        project.remove_job(existing[0])
     echo(f"Submitted → {job_id[:8]}")
     return job_id

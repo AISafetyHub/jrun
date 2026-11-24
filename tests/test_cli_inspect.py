@@ -28,6 +28,31 @@ class TestQueues:
         assert "5" in result.output
 
     @patch("jrun.commands.inspect.PlatformAPI")
+    def test_queues_cjk_location_keeps_model_column_aligned(self, mock_api_cls, runner, tmp_path, monkeypatch):
+        from jrun.api import PlatformAPI as RealAPI
+        mock_api_cls.queue_free_resources = RealAPI.queue_free_resources
+        monkeypatch.chdir(tmp_path)
+        mock_api = MagicMock()
+        queue = dict(SAMPLE_QUEUE)
+        queue["quotaInfoList"] = [{
+            "clusterDisplayName": "北京-大兴",
+            "zoneQuotaInfoList": [{"zoneDisplayName": "可用区A"}],
+        }]
+        mock_api.list_queues.return_value = [queue]
+        mock_api_cls.return_value = mock_api
+
+        result = runner.invoke(cli, ["queues", "--category", "dedicated"])
+
+        assert result.exit_code == 0, result.output
+        lines = result.output.splitlines()
+        header = next(line for line in lines if "MODEL" in line and "CATEGORY" in line)
+        row = next(line for line in lines if "jiuding_airs1_h100" in line)
+        from jrun.formatter import display_width
+        assert display_width(header[:header.index("MODEL")]) == display_width(
+            row[:row.index("J1_ADV_H1-SXM4-80GB")]
+        )
+
+    @patch("jrun.commands.inspect.PlatformAPI")
     def test_queues_ids_flag(self, mock_api_cls, runner, tmp_path, monkeypatch):
         self._use_real_quota_parser(mock_api_cls)
         monkeypatch.chdir(tmp_path)
@@ -50,6 +75,74 @@ class TestQueues:
         result = runner.invoke(cli, ["queues"])
         assert result.exit_code == 1
         assert "Unauthenticated" in result.output
+
+    @patch("jrun.commands.inspect.PlatformAPI")
+    def test_public_queue_cards_and_category(self, mock_api_cls, runner, tmp_path, monkeypatch):
+        from jrun.api import PlatformAPI as RealAPI
+        mock_api_cls.queue_free_resources = RealAPI.queue_free_resources
+        monkeypatch.chdir(tmp_path)
+        mock_api = MagicMock()
+        mock_api.list_queues.return_value = []
+        mock_api.list_shared_queues.return_value = [{
+            "queueId": "shared-q", "name": "Public-Pool-H20",
+            "queueCategory": "QUEUE_CATEGORY_PUBLIC",
+            "acceleratorModel": "H20", "clusterId": "c", "zoneId": "z",
+            "clusterDisplayName": "cluster", "zoneDisplayName": "zone",
+            "quota": {"acceleratorCount": 8}, "used": {"acceleratorCount": 3},
+        }]
+        mock_api.list_shared_queue_job_counts.return_value = [{
+            "queue": {"queueId": "shared-q"}, "runningCount": 1,
+        }]
+        mock_api.shared_queue_limits.return_value = {"max_jobs_per_projset": 4}
+        mock_api_cls.return_value = mock_api
+
+        result = runner.invoke(cli, ["queues", "--category", "public"])
+
+        assert result.exit_code == 0, result.output
+        assert "public" in result.output
+        assert "Public-Pool-H20" in result.output
+        assert "1/4" in result.output
+        mock_api.list_queues.assert_not_called()
+
+    @patch("jrun.commands.inspect.PlatformAPI")
+    def test_default_lists_all_categories_with_idle_limit(self, mock_api_cls, runner,
+                                                          tmp_path, monkeypatch):
+        from jrun.api import PlatformAPI as RealAPI
+        mock_api_cls.queue_free_resources = RealAPI.queue_free_resources
+        monkeypatch.chdir(tmp_path)
+        mock_api = MagicMock()
+        mock_api.list_queues.return_value = [SAMPLE_QUEUE]
+        shared = {"queueId": "shared-q", "name": "Public-Pool-H20", "clusterDisplayName": "c",
+                  "quota": {"acceleratorCount": 8}, "used": {"acceleratorCount": 3}}
+        mock_api.list_shared_queues.side_effect = lambda **kw: [
+            {**shared, "queueCategory": "QUEUE_CATEGORY_" + kw["queue_category"].upper()}]
+        mock_api.list_shared_queue_job_counts.return_value = [
+            {"queue": {"queueId": "shared-q"}, "runningCount": 2}]
+        mock_api.shared_queue_limits.return_value = {
+            "max_jobs_per_projset": 4, "max_idle_jobs_per_projset": 5}
+        mock_api_cls.return_value = mock_api
+
+        result = runner.invoke(cli, ["queues"])
+
+        assert result.exit_code == 0, result.output
+        assert "jiuding_airs1_h100" in result.output
+        assert "2/4" in result.output and "2/5" in result.output
+        assert {c.kwargs["queue_category"] for c in mock_api.list_shared_queues.call_args_list} \
+            == {"public", "idle"}
+
+    @patch("jrun.commands.inspect.PlatformAPI")
+    def test_count_errors_do_not_hide_queues(self, mock_api_cls, runner, tmp_path, monkeypatch):
+        from jrun.api import PlatformAPI as RealAPI
+        from jrun.errors import ApiError
+        mock_api_cls.queue_free_resources = RealAPI.queue_free_resources
+        monkeypatch.chdir(tmp_path)
+        mock_api = MagicMock()
+        mock_api.list_shared_queues.return_value = [{"queueId": "s", "name": "Public-Pool-X"}]
+        mock_api.list_shared_queue_job_counts.side_effect = ApiError("u", 403, "forbidden")
+        mock_api_cls.return_value = mock_api
+        result = runner.invoke(cli, ["queues", "--category", "idle"])
+        assert result.exit_code == 0, result.output
+        assert "Public-Pool-X" in result.output
 
 
 class TestGpuUsage:

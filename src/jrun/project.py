@@ -16,49 +16,21 @@ PLATFORM_BASE_URL = "https://platform-multi.baai.ac.cn/platform/modelTraining/jo
 class Project:
     def __init__(self, start: Path | None = None):
         self.jrun_dir = self._find_jrun_dir(start)
-        self.settings = self._load_settings()
 
     @classmethod
-    def init(cls, experiment_name: str | None = None, experiment_id: str | None = None,
-             platform: dict | None = None, directory: Path | None = None) -> "Project":
+    def init(cls, directory: Path | None = None) -> "Project":
+        """Create .jrun/ in ``directory`` (default: cwd).
+
+        settings.json only marks the project root; experiments are bound per
+        config via the top-level ``experiment:`` block.
+        """
         directory = directory or Path.cwd()
         jrun_dir = directory.resolve() / JRUN_DIR
         jrun_dir.mkdir(exist_ok=True)
-
-        data = {}
-        if experiment_name:
-            data["experiment_name"] = experiment_name
-        if experiment_id:
-            data["experiment_id"] = experiment_id
-        if platform:
-            data["platform"] = platform
-
-        path = jrun_dir / SETTINGS_FILE
-        path.write_text(json.dumps(data, indent=2) + "\n")
-
-        obj = object.__new__(cls)
-        obj.jrun_dir = jrun_dir
-        obj.settings = data
-        return obj
-
-    @property
-    def experiment_name(self) -> str:
-        return self.settings.get("experiment_name", "")
-
-    @property
-    def experiment_id(self) -> str | None:
-        return self.settings.get("experiment_id")
-
-    @property
-    def platform_ids(self) -> dict | None:
-        return self.settings.get("platform")
-
-    def build_job_url(self, job_id: str, platform: dict | None = None,
-                      experiment_name: str | None = None) -> str | None:
-        project_platform = self.platform_ids or {}
-        platform = {**project_platform, **(platform or {})}
-        name = experiment_name or self.experiment_name or None
-        return build_job_url(job_id, platform, name)
+        settings = jrun_dir / SETTINGS_FILE
+        if not settings.is_file():
+            settings.write_text("{}\n")
+        return cls(directory)
 
     # --- Tracker operations ---
 
@@ -118,6 +90,8 @@ class Project:
                 }
                 if experiment_id:
                     job_entry["experiment_id"] = experiment_id
+                if experiment_name:
+                    job_entry["experiment_name"] = experiment_name
                 tracker["jobs"][j["job_id"]] = job_entry
 
     def record_single_job(self, job_id: str, job_name: str,
@@ -300,10 +274,6 @@ class Project:
             f"No {JRUN_DIR}/ directory found. Run 'jrun init' first."
         )
 
-    def _load_settings(self) -> dict:
-        path = self.jrun_dir / SETTINGS_FILE
-        return json.loads(path.read_text())
-
 
 class _LockedTracker:
     def __init__(self, project: Project):
@@ -323,10 +293,6 @@ class _LockedTracker:
             self._project._save_tracker(self.data)
         self._lock_fd.close()
         return False
-
-
-def extract_platform_ids(experiment_json: dict) -> dict | None:
-    return Project.extract_platform_ids(experiment_json)
 
 
 def build_job_url(job_id: str, platform: dict | None,

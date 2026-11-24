@@ -23,11 +23,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from jrun.errors import ApiError
+from jrun.models import SHARED_CATEGORIES, normalize_queue_category
 
 PLATFORM_API_BASE = "https://platform-multi.baai.ac.cn"
 TOKEN_EXCHANGE_PATH = "/api/v1/users/token/exchange"
 USERINFO_PATH = "/api/v1/users/token/userinfo"
 QUEUE_SELECT_PATH = "/api/v1/queue/select"
+SHARED_QUEUE_LIST_PATH = "/api/v1/shared-queue/list"
+SHARED_QUEUE_JOB_COUNT_PATH = "/api/v1/shared-queue/job-count"
+SHARED_QUEUE_CONFIG_PATH = "/api/v1/shared-queue/config"
 PROJSETS_SELECT_JOINED_PATH = "/api/v1/projsets/select-joined"
 EXPERIMENT_PATH = "/api/v1/experiment"
 EXPERIMENT_DELETE_PATH = "/api/v1/experiment/delete"
@@ -169,6 +173,20 @@ class PlatformAPI:
         return self._request("GET", USERINFO_PATH,
                              headers={"AIRS-Token": self._resolve_token()})
 
+    def _current_user(self, path: str) -> tuple[str, str]:
+        """(creator_id, display name) of the token's user.
+
+        creatorId is a required int64 field on experiment create/delete; the
+        server does not derive it from the token.
+        """
+        user = self.get_userinfo()
+        data = user.get("data") if isinstance(user.get("data"), dict) else user
+        data = data or {}
+        creator_id = data.get("id") or ""
+        if not creator_id:
+            raise ApiError(path, message=f"no user id in userinfo response: {user}")
+        return str(creator_id), data.get("realName") or data.get("alias") or ""
+
     def list_joined_projsets(self) -> list[dict]:
         """Projsets the current account belongs to (cached per instance)."""
         if self._joined_projsets is None:
@@ -184,6 +202,46 @@ class PlatformAPI:
         """First joined projset ID, for endpoints that 403 without projset context."""
         projsets = self.list_joined_projsets()
         return projsets[0].get("id") if projsets else None
+
+    def resolve_project_context(self, project_set_name: str | None = None,
+                                project_name: str | None = None) -> tuple[str | None, str | None]:
+        """Resolve readable project names to the IDs required by platform APIs."""
+        if not project_set_name and not project_name:
+            return None, None
+        projsets = self.list_joined_projsets()
+        candidates = projsets
+        if project_set_name:
+            candidates = [p for p in candidates if p.get("name") == project_set_name]
+            if not candidates:
+                available = ", ".join(sorted(p.get("name", "") for p in projsets))
+                raise ValueError(
+                    f"project_set_name '{project_set_name}' not found; available: {available}"
+                )
+        projset_ids = {p.get("id") for p in candidates if p.get("id")}
+        if not project_name:
+            if len(projset_ids) != 1:
+                raise ValueError("project_set_name must identify exactly one project set")
+            return None, next(iter(projset_ids))
+
+        rows: list[dict] = []
+        if projset_ids:
+            for projset_id in projset_ids:
+                rows.extend(self._list_queues_one(None, projset_id))
+        else:
+            rows.extend(self.list_queues())
+        matches = [
+            row for row in rows
+            if row.get("projName") == project_name
+            and (not project_set_name or row.get("projsetName") == project_set_name)
+        ]
+        contexts = {(row.get("projId"), row.get("projsetId")) for row in matches}
+        contexts.discard((None, None))
+        if len(contexts) != 1:
+            available = ", ".join(sorted({row.get("projName", "") for row in rows if row.get("projName")}))
+            raise ValueError(
+                f"project_name '{project_name}' not found uniquely; available: {available}"
+            )
+        return next(iter(contexts))
 
     def _list_queues_one(self, proj_id: str | None,
                          projset_id: str | None) -> list[dict]:
@@ -216,34 +274,169 @@ class PlatformAPI:
             queues.extend(self._list_queues_one(proj_id=proj_id, projset_id=ps.get("id")))
         return queues
 
+    def list_shared_queues(self, proj_id: str | None = None,
+                           projset_id: str | None = None,
+                           queue_category: str | None = None,
+                           page_size: int = 100) -> list[dict]:
+        """List public/idle shared queues visible to a project set.
+
+        The platform exposes one shared-pool list; ``queue_category`` is a
+        submission mode and is attached to each normalized row for callers.
+        """
+        body: dict = {
+            "paging": {"order": "", "page": 1, "pageSize": page_size,
+                       "sort": "", "total": 0},
+        }
+        if proj_id:
+            body["projId"] = proj_id
+        if projset_id:
+            body["projsetId"] = projset_id
+        if queue_category:
+            body["queueCategory"] = normalize_queue_category(queue_category)
+        data = self._post(SHARED_QUEUE_LIST_PATH, body, proj_id=proj_id,
+                          projset_id=projset_id)
+        rows = data.get("sharedQueues") or data.get("items") or []
+        result = []
+        for item in rows:
+            queue = item.get("queue") if isinstance(item, dict) and isinstance(item.get("queue"), dict) else item
+            if not isinstance(queue, dict):
+                continue
+            normalized = dict(queue)
+            if queue_category:
+                    normalized["queueCategory"] = normalize_queue_category(queue_category)
+            result.append(normalized)
+        return result
+
+    def list_shared_queue_job_counts(self, proj_id: str | None = None,
+                                     projset_id: str | None = None,
+                                     queue_category: str = "public",
+                                     zone_id: str | None = None,
+                                     only_queueing: bool = False,
+                                     page_size: int = 100) -> list[dict]:
+        """Return per-queue running/queueing counts for public or idle mode."""
+        if projset_id is None:
+            projset_id = self._default_projset_id()
+        body: dict = {
+            "paging": {"order": "", "page": 1, "pageSize": page_size,
+                       "sort": "", "total": 0},
+            "queueCategory": normalize_queue_category(queue_category),
+            "allProjsets": False,
+            "onlyQueueing": only_queueing,
+        }
+        if projset_id:
+            body["projsetId"] = projset_id
+        if zone_id:
+            body["zoneId"] = zone_id
+        data = self._post(SHARED_QUEUE_JOB_COUNT_PATH, body,
+                          proj_id=proj_id, projset_id=projset_id)
+        return data.get("items") or data.get("sharedQueueJobCounts") or []
+
+    def shared_queue_limits(self, proj_id: str | None = None,
+                            projset_id: str | None = None) -> dict:
+        """Read shared-queue per-project-set limits from platform config."""
+        if projset_id is None:
+            projset_id = self._default_projset_id()
+        data = self._post(SHARED_QUEUE_CONFIG_PATH, {
+            "projId": proj_id or "",
+            "projsetId": projset_id or "",
+        }, proj_id=proj_id, projset_id=projset_id)
+        result = {}
+        for item in data.get("items") or []:
+            key = item.get("configKey")
+            if not key:
+                continue
+            value = item.get("configValue")
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                pass
+            result[key] = value
+        return result
+
+    def list_category_queues(self, queue_category: str | None,
+                             proj_id: str | None = None,
+                             projset_id: str | None = None) -> list[dict]:
+        """Dedicated queues (queue/select) or the shared pools for public/idle."""
+        category = normalize_queue_category(queue_category)
+        if category in SHARED_CATEGORIES:
+            return self.list_shared_queues(proj_id=proj_id, projset_id=projset_id,
+                                           queue_category=category)
+        return self.list_queues(proj_id=proj_id, projset_id=projset_id)
+
+    def shared_queue_budgets(self, proj_id: str | None = None,
+                             projset_id: str | None = None) -> dict:
+        """Remaining public/idle submit slots for a project set.
+
+        ``{category: remaining}`` where remaining = per-projset limit minus the
+        running + queueing jobs in that mode; None when no limit is configured.
+        """
+        limits = self.shared_queue_limits(proj_id=proj_id, projset_id=projset_id)
+        budgets = {}
+        for category, limit_key in (("QUEUE_CATEGORY_PUBLIC", "max_jobs_per_projset"),
+                                    ("QUEUE_CATEGORY_IDLE", "max_idle_jobs_per_projset")):
+            limit = limits.get(limit_key)
+            if not isinstance(limit, int):
+                budgets[category] = None
+                continue
+            rows = self.list_shared_queue_job_counts(
+                proj_id=proj_id, projset_id=projset_id, queue_category=category,
+            )
+            used = sum(int(row.get("runningCount") or 0) + int(row.get("queueingCount") or 0)
+                       for row in rows)
+            budgets[category] = max(limit - used, 0)
+        return budgets
+
     def find_queue(self, queue_name: str, proj_id: str | None = None,
-                   projset_id: str | None = None) -> dict | None:
-        for queue in self.list_queues(proj_id=proj_id, projset_id=projset_id):
-            if queue.get("name") == queue_name:
-                return queue
-        return None
+                   projset_id: str | None = None,
+                   queue_category: str | None = None,
+                   project_set_name: str | None = None,
+                   project_name: str | None = None,
+                   region_name: str | None = None,
+                   zone_name: str | None = None) -> dict | None:
+        resolved_proj_id, resolved_projset_id = self.resolve_project_context(
+            project_set_name, project_name
+        )
+        queues = self.list_category_queues(
+            queue_category, proj_id=proj_id or resolved_proj_id,
+            projset_id=projset_id or resolved_projset_id,
+        )
+        matches = filter_queues(
+            [queue for queue in queues if queue.get("name") == queue_name],
+            project_set_name=project_set_name, project_name=project_name,
+            region_name=region_name, zone_name=zone_name,
+        )
+        if len(matches) <= 1:
+            if not matches:
+                return None
+            return with_project_context(matches[0], resolved_proj_id, resolved_projset_id,
+                                        project_name, project_set_name)
+        locations = ", ".join(
+            f"{queue_location_info(q).get('region_name') or 'unknown'}/"
+            f"{queue_location_info(q).get('zone_name') or 'unknown'}"
+            for q in matches
+        )
+        raise ValueError(
+            f"queue '{queue_name}' has multiple locations: {locations}; "
+            "set project_set_name/project_name/region_name/zone_name"
+        )
 
     def create_experiment(self, name: str, queue: dict, image: str,
                           proj_id: str | None = None, projset_id: str | None = None,
                           description: str = "", command: str = "sleep 300",
                           envs: dict | None = None, image_region: str = "PUBLIC",
-                          priority: str = "high") -> str:
+                          priority: str = "high", queue_category: str | None = None,
+                          train_frame: str = "PyTorch", restart_policy: str = "Never",
+                          storage_info: list | None = None,
+                          platform_overrides: dict | None = None) -> str:
         """Create an experiment with one placeholder config. Returns experiment_id."""
         location = queue_location_info(queue)
         envs = {str(k): str(v) for k, v in (envs or {}).items()}
         proj_id = proj_id or queue.get("projId", "")
         projset_id = projset_id or queue.get("projsetId", "")
 
-        # creatorId is a required int64 proto field; the server does not fill it
-        # from the token, so resolve it from userinfo.
-        user = self.get_userinfo()
-        user_data = user.get("data") if isinstance(user.get("data"), dict) else user
-        creator_id = (user_data or {}).get("id") or ""
-        creator = (user_data or {}).get("realName") or (user_data or {}).get("alias") or ""
-        if not creator_id:
-            raise ApiError(EXPERIMENT_PATH,
-                           message=f"no user id in userinfo response: {user}")
+        creator_id, creator = self._current_user(EXPERIMENT_PATH)
 
+        category = normalize_queue_category(queue_category or queue.get("queueCategory"))
         resource_config = {
             "dataset": {"items": []},
             "id": "",
@@ -252,7 +445,9 @@ class PlatformAPI:
             "queueId": location["queue_id"],
             "queueName": location["queue_name"],
             "quotaId": location["quota_id"],
-            "podRestartPolicy": "Never",
+            "sharedQuotaId": location.get("shared_quota_id", ""),
+            "queueCategory": category,
+            "podRestartPolicy": restart_policy,
             "restartScope": "FailedInstanceOnly",
             "roleInfoList": [
                 {
@@ -273,8 +468,8 @@ class PlatformAPI:
             "imageRegion": image_region,
             "zoneId": location["zone_id"],
             "clusterId": location["cluster_id"],
-            "clusterDisplayName": location["cluster_display_name"],
-            "zoneDisplayName": location["zone_display_name"],
+            "clusterDisplayName": location["region_name"],
+            "zoneDisplayName": location["zone_name"],
             "modelStorageInfo": {"repoType": "PRIVATE", "modelVersionId": ""},
             "modelStorageInfoItems1": [],
             "modelStorageInfoItems": [],
@@ -288,7 +483,7 @@ class PlatformAPI:
             "name": name,
             "description": description,
             "experimentType": "1",
-            "trainFrame": "PyTorch",
+            "trainFrame": train_frame,
             "timeType": 60000,
             "duration": 0,
             "duration1": 0,
@@ -297,8 +492,8 @@ class PlatformAPI:
             "delivery": False,
             "mirrorType": "",
             "nativeCluster": "",
-            "restartPolicy": "",
-            "storageInfo": [
+            "restartPolicy": restart_policy,
+            "storageInfo": storage_info or [
                 {"directoryType": 5, "accessMode": 1},
                 {"directoryType": 4, "accessMode": 1},
                 {"directoryType": 2, "accessMode": 1},
@@ -327,12 +522,14 @@ class PlatformAPI:
             "experimentId": "",
             "nameSpace": "",
             "creator": creator,
-            "creatorId": str(creator_id),
+            "creatorId": creator_id,
             "profilerInfo": {"enabled": False, "level": "typical"},
             "heteroType": 1,
             "modelStorageInfo": {},
             "flag": False,
         }
+        if platform_overrides:
+            body.update(platform_overrides)
 
         data = self._post(EXPERIMENT_PATH, body, proj_id=proj_id, projset_id=projset_id,
                           cluster_id=location["cluster_id"], zone_id=location["zone_id"])
@@ -410,15 +607,7 @@ class PlatformAPI:
                           proj_id: str | None = None,
                           projset_id: str | None = None) -> dict:
         """Delete (archive) one experiment. Returns the raw response."""
-        # creatorId is a required field of each experimentItem; the server does
-        # not derive it from the token, so resolve it from userinfo (same as
-        # create_experiment).
-        user = self.get_userinfo()
-        user_data = user.get("data") if isinstance(user.get("data"), dict) else user
-        creator_id = (user_data or {}).get("id") or ""
-        if not creator_id:
-            raise ApiError(EXPERIMENT_DELETE_PATH,
-                           message=f"no user id in userinfo response: {user}")
+        creator_id, _ = self._current_user(EXPERIMENT_DELETE_PATH)
         # experiment/delete needs projset context like the other projset-scoped
         # endpoints; fall back to the account's first joined projset.
         if projset_id is None:
@@ -428,7 +617,7 @@ class PlatformAPI:
                 {
                     "experimentId": experiment_id,
                     "experimentName": experiment_name,
-                    "creatorId": str(creator_id),
+                    "creatorId": creator_id,
                     "archive": 1,
                 }
             ]
@@ -480,6 +669,17 @@ class PlatformAPI:
     @staticmethod
     def queue_free_resources(queue: dict) -> list[dict]:
         """Summarize per-accelerator-model total/used/free from a queue's usedQuota."""
+        if queue.get("quota") and queue.get("used"):
+            quota = queue.get("quota") or {}
+            used = queue.get("used") or {}
+            total = quota.get("acceleratorCount", 0) or 0
+            used_count = used.get("acceleratorCount", 0) or 0
+            return [{
+                "model": queue.get("acceleratorModel") or quota.get("acceleratorModel", ""),
+                "total": total,
+                "used": used_count,
+                "free": total - used_count,
+            }]
         computing = (queue.get("usedQuota") or {}).get("computing") or {}
         rows = []
         for model, quota in computing.items():
@@ -498,32 +698,113 @@ class PlatformAPI:
 
 def queue_location_info(queue: dict) -> dict:
     """Extract submission-relevant location fields from a queue/select row."""
-    cluster_display = ""
-    zone_display = ""
+    region_name = (
+        queue.get("clusterDisplayName") or queue.get("clusterName") or ""
+    )
+    zone_name = queue.get("zoneDisplayName") or queue.get("zoneName") or ""
     for cluster_info in queue.get("quotaInfoList") or []:
-        cluster_display = cluster_info.get("clusterDisplayName", "")
+        region_name = (
+            cluster_info.get("clusterDisplayName")
+            or cluster_info.get("clusterName")
+            or region_name
+        )
         for zone_info in cluster_info.get("zoneQuotaInfoList") or []:
-            zone_display = zone_info.get("zoneDisplayName", "")
+            zone_name = (
+                zone_info.get("zoneDisplayName")
+                or zone_info.get("zoneName")
+                or zone_name
+            )
             break
         break
 
-    accelerator_model = ""
+    accelerator_model = queue.get("acceleratorModel", "")
     for quota in queue.get("quotaDetailList") or []:
         accelerator_model = (quota.get("resourceDetail") or {}).get("acceleratorModel", "")
         break
 
     return {
-        "queue_id": queue.get("id", ""),
+        "queue_id": queue.get("id", "") or queue.get("queueId", ""),
         "queue_name": queue.get("name", ""),
         "quota_id": queue.get("quotaId", ""),
+        "shared_quota_id": queue.get("sharedQuotaId", ""),
         "cluster_id": queue.get("clusterId", ""),
         "zone_id": queue.get("zoneId", ""),
-        "cluster_display_name": cluster_display,
-        "zone_display_name": zone_display,
+        "region_name": region_name,
+        "zone_name": zone_name,
         "accelerator_model": accelerator_model,
         "proj_id": queue.get("projId", ""),
         "projset_id": queue.get("projsetId", ""),
+        "project_name": queue.get("projName", ""),
+        "project_set_name": queue.get("projsetName", ""),
+        "queue_category": queue.get("queueCategory", ""),
+        "accelerator_count": (queue.get("quota") or {}).get("acceleratorCount"),
+        "total": (queue.get("quota") or {}).get("acceleratorCount"),
+        "used": (queue.get("used") or {}).get("acceleratorCount"),
     }
+
+
+def filter_queues(queues: list[dict], project_set_name: str | None = None,
+                  project_name: str | None = None, region_name: str | None = None,
+                  zone_name: str | None = None) -> list[dict]:
+    """Keep the queue rows that match the given named location.
+
+    Project-set/project filters only apply when the rows carry those names
+    (shared pools do not).
+    """
+    matches = list(queues)
+    if project_set_name and any(queue.get("projsetName") for queue in matches):
+        matches = [
+            queue for queue in matches
+            if not queue.get("projsetName") or queue.get("projsetName") == project_set_name
+        ]
+    if project_name and any(queue.get("projName") for queue in matches):
+        matches = [
+            queue for queue in matches
+            if (queue.get("projName") or "") == project_name
+        ]
+    if region_name:
+        matches = [queue for queue in matches if region_name in _queue_region_names(queue)]
+    if zone_name:
+        matches = [queue for queue in matches if zone_name in _queue_zone_names(queue)]
+    return matches
+
+
+def with_project_context(queue: dict, proj_id: str | None, projset_id: str | None,
+                         project_name: str | None, project_set_name: str | None) -> dict:
+    """Copy of a queue row with missing project IDs/names filled in."""
+    result = dict(queue)
+    for key, value in (("projId", proj_id), ("projsetId", projset_id),
+                       ("projName", project_name), ("projsetName", project_set_name)):
+        if value and not result.get(key):
+            result[key] = value
+    return result
+
+
+def _queue_region_names(queue: dict) -> set[str]:
+    names = {
+        str(queue.get(key)) for key in ("clusterName", "clusterDisplayName")
+        if queue.get(key)
+    }
+    for cluster_info in queue.get("quotaInfoList") or []:
+        names.update(
+            str(cluster_info.get(key)) for key in ("clusterName", "clusterDisplayName")
+            if cluster_info.get(key)
+        )
+    return names
+
+
+def _queue_zone_names(queue: dict) -> set[str]:
+    names = {
+        str(queue.get(key)) for key in ("zoneName", "zoneDisplayName")
+        if queue.get(key)
+    }
+    for cluster_info in queue.get("quotaInfoList") or []:
+        for zone_info in cluster_info.get("zoneQuotaInfoList") or []:
+            names.update(
+                str(zone_info.get(key)) for key in ("zoneName", "zoneDisplayName")
+                if zone_info.get(key)
+            )
+    return names
 
 
 def _read_etc_accesskey(directory: Path) -> tuple[str, str] | None:

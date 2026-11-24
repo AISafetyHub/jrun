@@ -170,8 +170,10 @@ Body：
 - `usedQuota.computing.<acceleratorModel>.{total,used}` —— 按优先级分桶的
   配额总量与用量，`PlatformAPI.queue_free_resources()` 据此算空闲卡数。
 - `quotaDetailList[].resourceDetail.acceleratorModel` —— 队列的加速卡型号。
-- `quotaInfoList[].{clusterDisplayName, zoneQuotaInfoList[].zoneDisplayName}` ——
-  集群/可用区显示名。
+- `projsetName` / `projName` —— 项目集/项目名称；`quotaInfoList[].{clusterDisplayName,
+  zoneQuotaInfoList[].zoneDisplayName}` —— 地域/可用区显示名。jrun 的 YAML
+  使用 `project_set_name`、`project_name`、`region_name`、`zone_name`、
+  `queue_name` 进行名称链解析，平台 ID 只保留在内部提交 payload 中。
 - `status`：`QUEUE_STATUS_ACTIVE` 等。
 
 <details>
@@ -280,9 +282,11 @@ jrun 实现：按实验过滤用于 `jrun experiment jobs`（`experiment_jobs()`
 `jobInfos[]`，关键字段：
 
 - `id` / `experimentId` / `experimentName` / `configName` / `configId`
-- `status`：`Running` / `Pending` / `Cancelled` 等；`states` 为状态流转
-  历史（JSON 字符串，State 码：0=Pending, 1=Running, 4=Cancelled, 5=Starting,
-  6=Scheduling）
+- `status`：`Running` / `Pending` / `Approving` / `Cancelled` 等；`states` 为
+  状态流转历史（JSON 字符串，State 码：0=Pending, 1=Running, 4=Cancelled,
+  5=Starting, 6=Scheduling, 9=Approving）。`Approving` 是公共队列任务等待审批
+  （2026-11-24 实测，在审批中 stop 后变为 `Cancelled`）；`Pending` 是平台上等待
+  调度的真实 job。两者 jrun 都视为活跃、可停止的状态。
 - `queueId` / `queueName` / `priority` / `roleInfos[]`（含资源请求明细）
 - `clusterId` / `zoneId` / `clusterName` / `zoneName` 及显示名
 
@@ -322,6 +326,149 @@ jrun 实现：按实验过滤用于 `jrun experiment jobs`（`experiment_jobs()`
 ```
 
 </details>
+
+## 5.3 公共资源池与闲时资源
+
+- **公共队列列表**：`POST /api/v1/shared-queue/list`
+- **项目集共享队列作业计数**：`POST /api/v1/shared-queue/job-count`
+- **共享队列限制**：`POST /api/v1/shared-queue/config`
+- **认证**：`AIRS-Token`，有对应值时附带 `AIRS-Proj-ID` / `AIRS-Projset-ID`
+
+公共（public）和闲时（idle）是同一批共享资源池的两种提交方式：平台只有一份
+共享资源池列表，`queueCategory` 表示提交模式。`jrun queues` 因此把每个共享
+资源池在 `public` 和 `idle` 下各列一次，RUN/LIMIT 按模式分别统计。
+
+### shared-queue/list
+
+jrun 实现：`PlatformAPI.list_shared_queues()`（`jrun queues`、`find_queue` 的
+public/idle 分支）。
+
+Body（`projId` / `projsetId` / `queueCategory` 只在有值时发送）：
+
+```json
+{
+  "paging": {"order": "", "page": 1, "pageSize": 100, "sort": "", "total": 0},
+  "projId": "b121aae3-2198-4c91-9e72-355aa5a0e050",
+  "projsetId": "a8b8f665-03ed-4d6a-9b2e-2cb236a59d83",
+  "queueCategory": "QUEUE_CATEGORY_PUBLIC"
+}
+```
+
+响应：行列表位于 `sharedQueues[]`（部分版本为 `items[]`）。每行可能是队列对象
+本身，也可能包了一层 `{"queue": {...}}`，jrun 两种都接受，并把请求的
+`queueCategory` 写回每行。队列对象的关键字段：
+
+- `queueId`（或 `id`）/ `name` / `quotaId` / `sharedQuotaId` / `clusterId` /
+  `zoneId` —— 提交所需定位信息，经 `queue_location_info()` 提取。
+- `acceleratorModel` / `quota.acceleratorCount` / `used.acceleratorCount` ——
+  `queue_free_resources()` 据此计算总量/已用/空闲卡数。
+- `clusterName` / `clusterDisplayName` / `zoneName` / `zoneDisplayName`（或
+  `quotaInfoList[]` 中的同名字段）—— 地域/可用区名称，用于 `region_name` /
+  `zone_name` 匹配。
+- `projsetName` / `projName` / `projId` / `projsetId` —— 若存在，用于
+  `project_set_name` / `project_name` 过滤。
+
+```json
+{
+  "sharedQueues": [
+    {
+      "queue": {
+        "queueId": "5f0c...", "name": "Public-Pool-NVIDIA-V100",
+        "quotaId": "9a1e...", "sharedQuotaId": "77b2...",
+        "acceleratorModel": "NVIDIA_V100-PCIE-32GB",
+        "quota": {"acceleratorCount": 64}, "used": {"acceleratorCount": 40},
+        "clusterId": "7ca8...", "clusterDisplayName": "北京-大兴",
+        "zoneId": "da27...", "zoneDisplayName": "可用区A"
+      }
+    }
+  ]
+}
+```
+
+提交时，`resourceConfig.queueCategory` 使用 `QUEUE_CATEGORY_PUBLIC` 或
+`QUEUE_CATEGORY_IDLE`，并复用对应队列位置字段（`queue_id`、`quota_id`、
+`shared_quota_id`、`cluster_id`、`zone_id`）。在 `airsctl experiment modify`
+的 JSON 中，`queue_category` 是 protobuf 枚举数字：`dedicated=0`、
+`public=1`、`idle=2`；jrun 负责转换。
+
+### shared-queue/job-count
+
+jrun 实现：`PlatformAPI.list_shared_queue_job_counts()`（`jrun queues` 的
+RUN 列）。未显式传 `projset_id` 时使用账号第一个已加入的项目集。
+
+Body（`projsetId` / `zoneId` 只在有值时发送）：
+
+```json
+{
+  "paging": {"order": "", "page": 1, "pageSize": 100, "sort": "", "total": 0},
+  "queueCategory": "QUEUE_CATEGORY_IDLE",
+  "allProjsets": false,
+  "onlyQueueing": false,
+  "projsetId": "a8b8f665-03ed-4d6a-9b2e-2cb236a59d83",
+  "zoneId": "da27a37a-ef05-4972-873b-97dc96e62688"
+}
+```
+
+`queueCategory` 只能是 `QUEUE_CATEGORY_PUBLIC` 或 `QUEUE_CATEGORY_IDLE`。
+
+响应：`items[]`（部分版本为 `sharedQueueJobCounts[]`），每行对应一个共享队列：
+`queue.queueId`（或 `queue.id`）标识队列，`runningCount`、`queueingCount`
+及审批计数为本项目集在该模式下的作业数。`jrun queues` 只读取 `queue.queueId`
+和 `runningCount`；`PlatformAPI.shared_queue_budgets()`（auto 选队列和
+scheduler）把所有行的 `runningCount + queueingCount` 相加，作为该模式已占用的
+提交名额。
+
+```json
+{
+  "items": [
+    {"queue": {"queueId": "5f0c...", "name": "Public-Pool-NVIDIA-V100"},
+     "runningCount": 2, "queueingCount": 1}
+  ]
+}
+```
+
+### shared-queue/config
+
+jrun 实现：`PlatformAPI.shared_queue_limits()`（`jrun queues` 的 LIMIT 列）。
+未显式传 `projset_id` 时使用账号第一个已加入的项目集。
+
+Body：
+
+```json
+{"projId": "", "projsetId": "a8b8f665-03ed-4d6a-9b2e-2cb236a59d83"}
+```
+
+响应：`items[]`，每项为 `{configKey, configValue}`；`configValue` 可能是字符串，
+jrun 能转成整数时转成整数。public 模式的上限取 `max_jobs_per_projset`，idle
+模式取 `max_idle_jobs_per_projset`。
+
+```json
+{
+  "items": [
+    {"configKey": "max_jobs_per_projset", "configValue": "4"},
+    {"configKey": "max_idle_jobs_per_projset", "configValue": "8"}
+  ]
+}
+```
+
+在 `jrun queues` 中，job-count 和 config 只用于展示；任一失败时仍会打印队列
+列表，RUN/LIMIT 显示为 `-`。
+
+共享队列的 `priority` 是固定的：公共队列只接受 `high`，闲时队列只接受 `low`，
+其他值会被 `experiment modify` 拒绝（`QueueCategoryPriorityMismatch`：“This queue
+category only accepts priority「high」/「low」”，2026-11-24 两者都已实测；专属队列不
+限制）。jrun 对没写 `priority` 的公共/闲时任务自动写入要求的值
+（`models.CATEGORY_PRIORITY`），写了冲突的值则在提交前报配置错误。注意 modify 会
+克隆实验中第一个 config 作模板，所以不写这个值时会继承模板的 priority，换类别提交
+就会被拒。
+
+`queue_name: auto` 的提交和 scheduler 会把两者合起来算剩余名额
+（`PlatformAPI.shared_queue_budgets()`）：剩余 = 上限 − Σ(`runningCount` +
+`queueingCount`)，按 public/idle 模式分别计算；没有配置上限时视为不限。
+auto 分配（`placement.py`）在此基础上，结合 queue/select 和 shared-queue/list
+返回的空闲卡数（`queue_free_resources`）为每个任务选择队列；public 和 idle 是
+同一个物理池，空卡只计算一次。scheduler 每轮轮询前读取一次剩余名额，名额为 0
+时不启动该模式的等待任务；读取失败时直接尝试 `job run`。
 
 ---
 
@@ -477,10 +624,21 @@ Body 结构为 `{"experimentId": ..., "createExperimentRequest": {...}}`，其�
 所以「删除实验里的某个 config」也可以通过此接口提交不含该 config 的列表实现。
 jrun 的 `PlatformClient.modify_configs()` 通过 `airsctl experiment modify -f`
 实现同样的全量替换：每次 submit 只写入当前选中的 config，并在同一次
-modify 成功后用 `run_config()` 逐个执行 `airsctl job run`。被省略的 config
-会从 experiment 工作集移除，但不会因此 stop/cancel 已经启动的旧 job；
-job ID 和历史状态由本地 `.jrun/jobs.json` 维护。`remove_configs()` 仍保留给
-显式的 `jrun job remove` 生命周期操作，submit 本身不会调用它。
+modify 成功后用 `run_config()` 逐个执行 `airsctl job run`（输出中找不到 job
+ID 视为失败）。被省略的 config 会从 experiment 工作集移除，但不会因此
+stop/cancel 已经启动的 job；只有被覆盖（同名重新提交）的任务会在 modify 之前
+由 `tracking.release_job` 通过 `airsctl job stop` 停止旧 job。job ID 和历史
+状态由本地 `.jrun/jobs.json` 维护。`remove_configs()` 仍保留给显式的
+`jrun job remove` 生命周期操作，submit 本身不会调用它；remove 会先 `job stop`
+仍在进行中的 job 并等待其结束，再 `job cancel` 归档（cancel 只对已结束的 job 生效）。
+
+airsctl 侧的数据格式：`airsctl experiment list -e <id>` / `-N <name>` 返回的
+是**裸的 snake_case 实验文档**（顶层直接是 `experiment_id`、
+`experiment_name`、`advance_config_infos`、`resource_config_list`、
+`role_info_list` 等，没有 `data` 包装，已实测确认），`experiment modify -f`
+也接受同样的 snake_case 文档。因此 `platform.py` 只处理 snake_case；这里的
+camelCase 字段名只适用于 REST API。按名称查找时 jrun 要求返回文档的
+`experiment_name` 与请求名称精确一致。
 
 因此，使用 jrun 的 experiment 应视为当前 YAML 的专属容器；共享 experiment
 会在每次 submit 时被完整替换。
@@ -555,14 +713,50 @@ Body：
 
 ---
 
+## 11. 任务运行时环境变量（实测）
+
+2026-11-24 用一个探测任务实测：jrun 提交到闲时 `Public-Pool-NVIDIA-V100`，单节点、
+0 卡，镜像 `harbor.baai.ac.cn/llm-safety-center/enviroments:agents-v1.0.0`，
+任务把 `env` 写到共享存储。下表只列平台注入的变量；`CUDA_VERSION`、
+`NCCL_VERSION`、`VLLM_*`、`UV_*`、`PIP_INDEX_URL`、`HOME` 等来自镜像，换镜像会变，
+不要依赖。
+
+| 变量 | 实测值 / 含义 |
+|---|---|
+| `AIRS_WORKLOAD_TYPE` | `experiment`（实验任务）；开发环境（workspace）中为 `workspace` |
+| `AIRS_EXPERIMENT` | `job` |
+| `AIRS_EXPERIMENT_ID` | 所属实验 UUID |
+| `AIRS_WORKSPACE_ID` | 只在开发环境中存在，实验任务中没有 |
+| `HOSTNAME` | `job-<job UUID>-master-0`；没有单独的 job ID 变量，只能从这里解析 |
+| `MASTER_ADDR` / `MASTER_PORT` | master pod 主机名 / `23456` |
+| `RANK` / `WORLD_SIZE` | 单节点实测为 `0` / `1` |
+| `PET_NNODES` / `PET_NODE_RANK` / `PET_WORLD_SIZE` | torchrun（`torch.distributed.run`）读取的节点数 / 节点序号 / 节点总数，单节点为 `1` / `0` / `1` |
+| `PET_MASTER_ADDR` / `PET_MASTER_PORT` | 同 `MASTER_ADDR` / `MASTER_PORT`，供 torchrun 使用 |
+| `PET_NPROC_PER_NODE` | `auto`：不写 `--nproc_per_node` 时 torchrun 按可见 GPU 数启动进程 |
+| `NVIDIA_VISIBLE_DEVICES` | 0 卡任务实测为 `all` |
+| `PATH` | 前置 `/client-tools`（内含 `airsctl`） |
+
+jrun 写入的变量也会出现在任务环境中（实测）：config 的 `envs:` 写入
+`hyper_parameter`，平台把它们作为环境变量注入；`queue_name: auto` 分配后的任务
+还带有 `JRUN_QUEUE_NAME`、`JRUN_ACCELERATOR_MODEL`、`JRUN_ACCELERATOR_COUNT`。
+
+平台不提供：job ID 变量、队列名、卡型和卡数（因此 jrun 对 auto 任务注入
+`JRUN_*`）。0 卡任务的镜像里没有 `nvidia-smi`。多节点任务的 `RANK`/`PET_*`
+取值尚未实测，预期是每个节点不同的节点序号。
+
+---
+
 ## 附：jrun 接口使用对照表
 
 | 接口 | jrun 模块/函数 | 用途 |
 |---|---|---|
 | `POST /users/token/exchange` | `api.py` `exchange_token` / `compute_signature` | AK/SK 换 Token |
 | `GET /users/token/userinfo` | `api.py` `get_userinfo` | 取 `creatorId`（建实验前） |
-| `POST /projsets/select-joined` | `api.py` `list_joined_projsets` | projset 上下文补全 |
-| `POST /queue/select` | `api.py` `list_queues` / `find_queue` / `queue_free_resources` | `jrun queues`、队列名→ID 解析、空闲配额 |
+| `POST /projsets/select-joined` | `api.py` `list_joined_projsets` / `resolve_project_context` | projset 上下文补全；`project_set_name`/`project_name` → ID |
+| `POST /queue/select` | `api.py` `list_queues` / `list_category_queues` / `find_queue` / `queue_free_resources`；`placement.py` `collect_candidates` | `jrun queues`、队列名→ID 解析、空闲配额、auto 选队列的专属候选 |
+| `POST /shared-queue/list` | `api.py` `list_shared_queues` / `list_category_queues`；`placement.py` `collect_candidates` | 公共/闲时队列与卡型、配额、集群/可用区查询、auto 选队列的共享候选 |
+| `POST /shared-queue/job-count` | `api.py` `list_shared_queue_job_counts` / `shared_queue_budgets` | 公共/闲时项目运行数和排队数；auto 选队列和 scheduler 的剩余提交名额 |
+| `POST /shared-queue/config` | `api.py` `shared_queue_limits` / `shared_queue_budgets` | 公共/闲时项目集上限；剩余提交名额 |
 | `POST /job/select` | `api.py` `experiment_jobs` / `experiment_jobs_all` | `jrun experiment jobs`（按实验过滤；按队列过滤未使用） |
 | `POST /workspaces/select` | 未使用 | — |
 | `POST /experiment` | `api.py` `create_experiment` | `jrun experiment create` / submit 自动建实验 |

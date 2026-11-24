@@ -1,0 +1,55 @@
+description: Auto queue placement - spread a grid over whichever queues have free cards
+
+# queue_name: auto lets jrun pick the queue at submit time. It reads every
+# candidate queue's free cards (and the project set's public/idle submit
+# slots, see RUN/LIMIT in `jrun queues`) and places each job:
+#   1. on a queue whose free cards fit it now (starts immediately),
+#   2. else queued on a dedicated queue (if dedicated is allowed), or on a
+#      public/idle queue that still has a submit slot,
+#   3. else it waits in the scheduler until a public/idle slot frees up.
+# Preview the placement with `jrun submit examples/auto.yaml --dry-run`.
+experiment:
+  name: jrun_example
+
+search:
+  name: auto_eval
+
+  job_template:
+    name: auto_eval_{data}
+    image: harbor.baai.ac.cn/llm-safety-center/enviroments:agents-v1.0.0
+    commands:
+      # $$ keeps the variable for the remote shell. JRUN_QUEUE_NAME /
+      # JRUN_ACCELERATOR_MODEL / JRUN_ACCELERATOR_COUNT are injected by jrun
+      # into every placed job; HOSTNAME (job-<job id>-master-0) and
+      # AIRS_EXPERIMENT_ID come from the platform. A plain `torchrun` (no
+      # --nproc_per_node) already uses every visible GPU.
+      - echo "dataset={data} on $$JRUN_ACCELERATOR_MODEL x$$JRUN_ACCELERATOR_COUNT ($$JRUN_QUEUE_NAME)"
+      - echo "host=$$HOSTNAME experiment=$$AIRS_EXPERIMENT_ID"
+    resource_config:
+      queue_name: auto
+      # Categories in preference order (dedicated, public, idle). idle jobs
+      # can be preempted, so only list it when that is acceptable.
+      queue_category: [public, idle]
+      project_set_name: baai-safety
+      project_name: baai-safety_research
+      # (model, count) pairs, matched by position, in preference order.
+      # A scalar count applies to every model.
+      accelerator_model: [NVIDIA_A100-SXM4-40GB, NVIDIA_V100-PCIE-32GB]
+      accelerator_count: [1, 1]
+      # Shared by every pair: size for the largest one.
+      cpu_cores: 8
+      mem_gib: 64
+      shared_mem_gib: 16
+      # No priority: public only accepts high and idle only low, so jrun sets
+      # the right one for whichever category each job lands in.
+    run_options:              # required because public is allowed
+      duration_hours: 12
+      queue_priority_mode: normal
+      usage_desc: auto placement example
+      enable_checkpoint: false
+
+  params:
+    - name: data
+      values: [mmlu, gsm8k, humaneval, arc, hellaswag, truthfulqa]
+
+  sampling: grid

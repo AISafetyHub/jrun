@@ -1,9 +1,12 @@
 import json
+import os
+
 import pytest
 from unittest.mock import patch, MagicMock
 
 from jrun.errors import PlatformError
-from jrun.models import ExperimentSpec, Job, ResourceConfig
+from jrun.models import (ExperimentSpec, Job, ResourceConfig, RoleConfig, RunOptions,
+                         job_target)
 from jrun.platform import PlatformClient
 
 
@@ -44,6 +47,18 @@ class TestParseJobStatus:
 
 class TestPlatformClientCommands:
     @patch("subprocess.run")
+    def test_non_utf8_airsctl_output_is_reported(self, mock_run):
+        mock_run.side_effect = [
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid"),
+            MagicMock(returncode=1, stdout=b"bad output \xff", stderr=b"error \xff"),
+        ]
+        with pytest.raises(PlatformError, match="error"):
+            PlatformClient()._run(["experiment", "modify", "-f", "config.json"])
+
+        assert mock_run.call_count == 2
+        assert mock_run.call_args_list[1].kwargs["text"] is False
+
+    @patch("subprocess.run")
     def test_experiment_list_with_id(self, mock_run):
         mock_run.return_value = MagicMock(stdout='{"data": []}', returncode=0)
         client = PlatformClient()
@@ -76,30 +91,24 @@ class TestPlatformClientCommands:
     @patch("subprocess.run")
     def test_job_run_with_exp_and_config(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0, stdout="")
-        client = PlatformClient()
-        client.job_run(exp_id="eid", config_name="cfg")
+        PlatformClient().job_run("eid", "cfg")
         mock_run.assert_called_once_with(
             ["airsctl", "job", "run", "-e", "eid", "-n", "cfg"],
             capture_output=True, text=True,
         )
 
     @patch("subprocess.run")
-    def test_job_run_with_exp_name_only(self, mock_run):
+    def test_job_run_shared_queue_options(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0, stdout="")
-        client = PlatformClient()
-        client.job_run(exp_name="my-exp", config_name="cfg")
-        mock_run.assert_called_once_with(
-            ["airsctl", "job", "run", "-N", "my-exp", "-n", "cfg"],
-            capture_output=True, text=True,
+        PlatformClient().job_run(
+            "eid", "cfg",
+            run_options=RunOptions(duration_hours=8, enable_checkpoint=True,
+                                   queue_priority_mode="high", usage_desc="research"),
         )
-
-    @patch("subprocess.run")
-    def test_job_run_prefers_exp_id_over_name(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="")
-        client = PlatformClient()
-        client.job_run(exp_name="stale-exp", exp_id="eid", config_name="cfg")
         mock_run.assert_called_once_with(
-            ["airsctl", "job", "run", "-e", "eid", "-n", "cfg"],
+            ["airsctl", "job", "run", "-e", "eid", "-n", "cfg",
+             "--duration-hours", "8", "--enable-checkpoint",
+             "--queue-priority-mode", "high", "--usage-desc", "research"],
             capture_output=True, text=True,
         )
 
@@ -136,42 +145,6 @@ class TestPlatformClientCommands:
         mock_run.return_value = MagicMock(returncode=0, stdout="no job data")
         info = PlatformClient().get_job_info("j1")
         assert info is None
-
-    @patch.object(PlatformClient, "job_run")
-    @patch.object(PlatformClient, "experiment_modify")
-    @patch.object(PlatformClient, "experiment_list")
-    def test_submit_uses_experiment_id_for_run(
-        self, mock_list, mock_modify, mock_job_run
-    ):
-        experiment = {
-            "advance_config_infos": [
-                {
-                    "config_name": "base",
-                    "command": "echo old",
-                    "conf_id": "conf-id",
-                    "resource_config_list": [],
-                }
-            ]
-        }
-        job_id = "11111111-1111-1111-1111-111111111111"
-        mock_list.return_value = MagicMock(
-            returncode=0, stdout=json.dumps(experiment), stderr=""
-        )
-        mock_job_run.return_value = MagicMock(
-            returncode=0, stdout=f"Job {job_id} submitted", stderr=""
-        )
-
-        result = PlatformClient().submit_job(
-            Job(name="target", command="echo new"),
-            exp_name="stale-exp",
-            exp_id="eid",
-        )
-
-        assert result == job_id
-        mock_modify.assert_called_once()
-        mock_job_run.assert_called_once_with(
-            exp_id="eid", config_name="target"
-        )
 
 
 class TestRetryOnUnauthenticated:
@@ -223,148 +196,182 @@ class TestRetryOnUnauthenticated:
         mock_run.side_effect = [fail_result, success_result]
 
         client = PlatformClient()
-        result = client._run(["job", "list"], check=False)
+        client._run(["job", "list"], check=False)
 
         assert mock_run.call_count == 2
         mock_sleep.assert_called_once_with(35)
 
 
-class TestCountExperimentConfigs:
+class TestGetExperiment:
     @patch("subprocess.run")
-    def test_returns_config_count(self, mock_run):
-        exp_data = {"advance_config_infos": [{"config_name": f"cfg_{i}"} for i in range(5)]}
+    def test_reads_once_and_caches(self, mock_run):
+        exp_data = {"experiment_id": "eid",
+                    "advance_config_infos": [{"config_name": f"cfg_{i}"} for i in range(5)]}
         mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(exp_data), stderr="")
         client = PlatformClient()
-        assert client.count_experiment_configs("exp-123") == 5
+        first = client.get_experiment("eid")
+        assert len(PlatformClient.experiment_configs(first)) == 5
+        first["advance_config_infos"].clear()  # callers get copies
+        assert len(client.experiment_configs(client.get_experiment("eid"))) == 5
+        assert mock_run.call_count == 1
 
+    @pytest.mark.parametrize("returncode,stdout", [
+        (1, ""), (0, "not json"), (0, "[1]"), (0, '{"no_id": true}'),
+    ])
     @patch("subprocess.run")
-    def test_returns_zero_for_empty(self, mock_run):
-        exp_data = {"advance_config_infos": []}
-        mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(exp_data), stderr="")
-        client = PlatformClient()
-        assert client.count_experiment_configs("exp-123") == 0
-
-    @patch("subprocess.run")
-    def test_returns_none_on_failure(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error")
-        client = PlatformClient()
-        assert client.count_experiment_configs("exp-123") is None
-
-    @patch("subprocess.run")
-    def test_returns_none_on_invalid_json(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="not json", stderr="")
-        client = PlatformClient()
-        assert client.count_experiment_configs("exp-123") is None
+    def test_bad_responses(self, mock_run, returncode, stdout):
+        mock_run.return_value = MagicMock(returncode=returncode, stdout=stdout, stderr="err")
+        assert PlatformClient().get_experiment("eid") is None
+        with pytest.raises(PlatformError):
+            PlatformClient().get_experiment("eid", check=True)
 
 
-class TestSubmitJobSpecOverrides:
-    def _make_experiment(self):
-        return {
-            "advance_config_infos": [
-                {
-                    "config_name": "base",
-                    "command": "echo old",
-                    "resource_config_list": [
-                        {
-                            "priority": "medium",
-                            "basic_image": "old-image:1",
-                            "queue_id": "old-q",
-                            "queue_name": "old-queue",
-                            "role_info_list": [
-                                {"name": "Master", "replicas": 1,
-                                 "resource_request_detail": {}}
-                            ],
-                        }
-                    ],
-                }
-            ]
-        }
+def _template_experiment():
+    return {
+        "experiment_id": "eid",
+        "advance_config_infos": [{
+            "config_name": "base",
+            "command": "echo old",
+            "resource_config_list": [{
+                "priority": "medium",
+                "basic_image": "old-image:1",
+                "queue_id": "old-q",
+                "queue_name": "old-queue",
+                "role_info_list": [{
+                    "name": "Master", "replicas": 1, "resource_region": 4,
+                    "resource_request_detail": {"accelerator_resource_name": "nvidia.com/gpu"},
+                }],
+            }],
+        }],
+    }
 
-    def _submit(self, mock_list, mock_modify, mock_job_run, job, spec, queue_location):
-        mock_list.return_value = MagicMock(
-            returncode=0, stdout=json.dumps(self._make_experiment()), stderr=""
+
+def _modify(job, spec=None, location=None, experiment=None):
+    """Run modify_configs on a snapshot and return the written document."""
+    captured = {}
+
+    def capture(path):
+        captured.update(json.loads(open(path).read()))
+        return MagicMock(returncode=0)
+
+    target_key = job_target(job, spec).location_key
+    with patch.object(PlatformClient, "experiment_modify", side_effect=capture):
+        PlatformClient().modify_configs(
+            [job], "eid", spec=spec,
+            queue_locations={target_key: location} if location else None,
+            experiment_data=experiment or _template_experiment(),
         )
-        captured = {}
+    return captured
 
-        def fake_modify(path):
-            captured.update(json.loads(open(path).read()))
-            return MagicMock(returncode=0, stdout="", stderr="")
 
-        mock_modify.side_effect = fake_modify
-        mock_job_run.return_value = MagicMock(
-            returncode=0, stdout="Job 11111111-1111-1111-1111-111111111111 ok", stderr=""
-        )
-        PlatformClient().submit_job(job, exp_name=None, exp_id="eid",
-                                    spec=spec, queue_location=queue_location)
-        return captured["advance_config_infos"][-1]["resource_config_list"][0]
+def _resource(document):
+    return document["advance_config_infos"][0]["resource_config_list"][0]
 
-    @patch.object(PlatformClient, "job_run")
-    @patch.object(PlatformClient, "experiment_modify")
-    @patch.object(PlatformClient, "experiment_list")
-    def test_spec_overrides_image_and_queue(self, mock_list, mock_modify, mock_job_run):
-        from jrun.models import ExperimentSpec
+
+class TestBuildJobConfig:
+    LOCATION = {"queue_id": "qid-1", "queue_name": "q1", "quota_id": "quota-1",
+                "cluster_id": "cid", "zone_id": "zid",
+                "region_name": "北京", "zone_name": "A",
+                "accelerator_model": "H100"}
+
+    def test_spec_overrides_image_and_queue(self):
         spec = ExperimentSpec(name="e", image="new-image:2", queue_name="q1")
-        location = {"queue_id": "qid-1", "queue_name": "q1", "quota_id": "quota-1",
-                    "cluster_id": "cid", "zone_id": "zid",
-                    "cluster_display_name": "北京", "zone_display_name": "A"}
-        res = self._submit(mock_list, mock_modify, mock_job_run,
-                           Job(name="j", command="echo hi"), spec, location)
+        res = _resource(_modify(Job(name="j", command="echo hi"), spec, self.LOCATION))
         assert res["basic_image"] == "new-image:2"
-        # airsctl modify JSON needs the RepoTypes enum as an integer
+        # airsctl modify JSON needs enums as integers
         assert res["image_region"] == 1
-        assert res["queue_id"] == "qid-1"
-        assert res["queue_name"] == "q1"
-        assert res["quota_id"] == "quota-1"
-        assert res["cluster_id"] == "cid"
-        assert res["zone_id"] == "zid"
-        assert res["cluster_display_name"] == "北京"
+        assert res["queue_category"] == 0
+        assert (res["queue_id"], res["queue_name"], res["quota_id"]) == ("qid-1", "q1", "quota-1")
+        assert (res["cluster_id"], res["zone_id"]) == ("cid", "zid")
+        assert (res["cluster_display_name"], res["zone_display_name"]) == ("北京", "A")
+        detail = res["role_info_list"][0]["resource_request_detail"]
+        assert detail["accelerator_model"] == "H100"
+        assert detail["accelerator_resource_name"] == "nvidia.com/gpu"
+        assert res["priority"] == "medium"  # untouched template value
 
-    @patch.object(PlatformClient, "job_run")
-    @patch.object(PlatformClient, "experiment_modify")
-    @patch.object(PlatformClient, "experiment_list")
-    def test_spec_applies_without_resource_config(self, mock_list, mock_modify, mock_job_run):
-        """Spec overrides apply even when the job has no resource_config."""
-        from jrun.models import ExperimentSpec
-        spec = ExperimentSpec(name="e", image="new-image:2", queue_name="q1")
-        res = self._submit(mock_list, mock_modify, mock_job_run,
-                           Job(name="j", command="echo hi"), spec, {"queue_id": "qid-1"})
-        assert res["basic_image"] == "new-image:2"
-        assert res["queue_id"] == "qid-1"
-        # Untouched fields keep template values
-        assert res["priority"] == "medium"
-
-    @patch.object(PlatformClient, "job_run")
-    @patch.object(PlatformClient, "experiment_modify")
-    @patch.object(PlatformClient, "experiment_list")
-    def test_explicit_cluster_zone_win(self, mock_list, mock_modify, mock_job_run):
-        from jrun.models import ExperimentSpec
+    @pytest.mark.parametrize("category,expected", [("idle", "low"), ("public", "high")])
+    def test_shared_job_gets_required_priority(self, category, expected):
+        # Regression: public/idle reject a priority inherited from the template
+        # config (QueueCategoryPriorityMismatch), e.g. a public job submitted
+        # after an idle config became the template.
         spec = ExperimentSpec(name="e", image="img", queue_name="q1",
-                              cluster_id="explicit-c", zone_id="explicit-z")
-        location = {"queue_id": "qid-1", "cluster_id": "lookup-c", "zone_id": "lookup-z"}
-        res = self._submit(mock_list, mock_modify, mock_job_run,
-                           Job(name="j", command="echo hi"), spec, location)
-        assert res["cluster_id"] == "explicit-c"
-        assert res["zone_id"] == "explicit-z"
+                              queue_category=category)
+        assert _resource(_modify(Job(name="j"), spec, self.LOCATION))["priority"] == expected
 
-    @patch.object(PlatformClient, "job_run")
-    @patch.object(PlatformClient, "experiment_modify")
-    @patch.object(PlatformClient, "experiment_list")
-    def test_spec_image_region_private_maps_to_int(self, mock_list, mock_modify, mock_job_run):
-        from jrun.models import ExperimentSpec
+    def test_dedicated_keeps_template_priority(self):
+        spec = ExperimentSpec(name="e", image="img", queue_name="q1")
+        assert _resource(_modify(Job(name="j"), spec, self.LOCATION))["priority"] == "medium"
+
+    def test_explicit_cluster_zone_win(self):
         spec = ExperimentSpec(name="e", image="img", queue_name="q1",
-                              image_region="PRIVATE")
-        res = self._submit(mock_list, mock_modify, mock_job_run,
-                           Job(name="j", command="echo hi"), spec, {"queue_id": "qid-1"})
-        assert res["image_region"] == 2
+                              region_name="explicit-region", zone_name="explicit-zone")
+        res = _resource(_modify(Job(name="j"), spec, self.LOCATION))
+        assert res["cluster_display_name"] == "explicit-region"
+        assert res["zone_display_name"] == "explicit-zone"
 
-    @patch.object(PlatformClient, "job_run")
-    @patch.object(PlatformClient, "experiment_modify")
-    @patch.object(PlatformClient, "experiment_list")
-    def test_no_spec_keeps_template(self, mock_list, mock_modify, mock_job_run):
-        res = self._submit(mock_list, mock_modify, mock_job_run,
-                           Job(name="j", command="echo hi"), None, None)
+    def test_image_region_private_maps_to_int(self):
+        spec = ExperimentSpec(name="e", image="img", image_region="PRIVATE")
+        assert _resource(_modify(Job(name="j"), spec))["image_region"] == 2
+
+    def test_job_image_wins_over_spec(self):
+        spec = ExperimentSpec(name="e", image="spec-img")
+        res = _resource(_modify(Job(name="j", image="job-img"), spec))
+        assert res["basic_image"] == "job-img"
+
+    def test_no_spec_keeps_template(self):
+        res = _resource(_modify(Job(name="j", command="echo hi")))
         assert res["basic_image"] == "old-image:1"
         assert res["queue_id"] == "old-q"
+        assert "queue_category" not in res
+
+    def test_explicit_accelerator_model_beats_queue_lookup(self):
+        job = Job(name="j", resource_config=ResourceConfig(
+            queue_name="q1", accelerator_model="A100", accelerator_count=2))
+        res = _resource(_modify(job, None, self.LOCATION))
+        detail = res["role_info_list"][0]["resource_request_detail"]
+        assert detail["accelerator_model"] == "A100"
+        assert detail["accelerator_count"] == 2
+
+    def test_resource_region_applies_to_master_role(self):
+        job = Job(name="j", resource_config=ResourceConfig(resource_region=1))
+        res = _resource(_modify(job))
+        assert res["role_info_list"][0]["resource_region"] == 1
+        assert "resource_region" not in res
+
+    def test_roles_inherit_top_level_resources(self):
+        job = Job(name="j", resource_config=ResourceConfig(
+            cpu_cores=8, accelerator_count=4,
+            roles=[RoleConfig(name="Master"),
+                   RoleConfig(name="Worker", replicas=3, accelerator_count=8,
+                              extra_label_info={"k": "v"})],
+        ))
+        roles = _resource(_modify(job))["role_info_list"]
+        assert [(r["name"], r["replicas"]) for r in roles] == [("Master", 1), ("Worker", 3)]
+        assert roles[0]["resource_request_detail"]["accelerator_count"] == 4
+        assert roles[1]["resource_request_detail"]["accelerator_count"] == 8
+        assert roles[1]["resource_request_detail"]["cpu_cores"] == 8
+        # template detail and resource_region are inherited by every role
+        assert roles[1]["resource_request_detail"]["accelerator_resource_name"] == "nvidia.com/gpu"
+        assert roles[1]["resource_region"] == 4
+        assert roles[1]["extra_label_info"] == {"k": "v"}
+
+    def test_envs_and_job_fields(self):
+        experiment = _template_experiment()
+        experiment["advance_config_infos"][0]["hyper_parameter_present"] = []
+        job = Job(name="j", envs={"A": 1}, git_branch="dev",
+                  platform_overrides={"git_branch": "raw", "slots_per_worker": 2})
+        config = _modify(job, experiment=experiment)["advance_config_infos"][0]
+        assert config["hyper_parameter"] == {"A": "1"}
+        assert config["hyper_parameter_present"] == [{"key": "A", "value": "1"}]
+        assert config["git_branch"] == "dev"  # typed field beats raw override
+        assert config["slots_per_worker"] == 2
+
+    def test_experiment_level_fields_written_to_document(self):
+        spec = ExperimentSpec(name="e", train_frame="TensorFlow",
+                              platform_overrides={"hetero_type": 2})
+        document = _modify(Job(name="j"), spec)
+        assert document["train_frame"] == "TensorFlow"
+        assert document["hetero_type"] == 2
 
 
 class TestModifyConfigs:
@@ -471,7 +478,7 @@ class TestModifyConfigs:
         )
         spec = ExperimentSpec(
             name="exp", image="new-image", image_region="PRIVATE",
-            queue_name="q1", cluster_id="explicit-cluster",
+            queue_name="q1", region_name="explicit-region",
         )
         location = {
             "queue_id": "qid", "queue_name": "q1", "quota_id": "quota",
@@ -479,46 +486,147 @@ class TestModifyConfigs:
         }
         PlatformClient().modify_configs(
             [Job(name="job", command="echo")], "eid", spec=spec,
-            queue_locations={"q1": location},
+            queue_locations={job_target(Job(name="job"), spec).location_key: location},
         )
         resource = captured["advance_config_infos"][0]["resource_config_list"][0]
         assert resource["basic_image"] == "new-image"
         assert resource["image_region"] == 2
         assert resource["queue_id"] == "qid"
         assert resource["queue_name"] == "q1"
-        assert resource["cluster_id"] == "explicit-cluster"
+        assert resource["cluster_display_name"] == "explicit-region"
         assert resource["zone_id"] == "zone"
+
+    @patch("subprocess.run")
+    def test_modify_failure_raises_and_cleans_temp_file(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="permission denied")
+        with pytest.raises(PlatformError, match="permission denied"):
+            PlatformClient().modify_configs(
+                [Job(name="job", command="echo")], "eid",
+                experiment_data=self._experiment(),
+            )
+        args = mock_run.call_args[0][0]
+        assert args[:4] == ["airsctl", "experiment", "modify", "-f"]
+        assert not os.path.exists(args[4])
+
+    @pytest.mark.parametrize("jobs,match", [
+        ([], "no jobs"),
+        ([Job(name="a"), Job(name="a")], "duplicate job names: a"),
+        ([Job(name=" ")], "non-empty name"),
+    ])
+    def test_invalid_job_sets_rejected(self, jobs, match):
+        with pytest.raises(PlatformError, match=match):
+            PlatformClient().modify_configs(jobs, "eid", experiment_data=self._experiment())
+
+    def test_template_required(self):
+        with pytest.raises(PlatformError, match="no existing config"):
+            PlatformClient().modify_configs(
+                [Job(name="a")], "eid",
+                experiment_data={"experiment_id": "eid", "advance_config_infos": []},
+            )
 
     @patch.object(PlatformClient, "experiment_modify")
     @patch.object(PlatformClient, "experiment_list")
-    def test_modify_failure_prevents_success(self, mock_list, mock_modify):
+    def test_public_queue_roles_and_overrides(self, mock_list, mock_modify):
         mock_list.return_value = MagicMock(
             returncode=0, stdout=json.dumps(self._experiment()), stderr=""
         )
-        mock_modify.return_value = MagicMock(
-            returncode=1, stdout="", stderr="permission denied"
+        captured = {}
+        mock_modify.side_effect = lambda path: (
+            captured.update(json.loads(open(path).read())) or MagicMock(returncode=0)
         )
-        with pytest.raises(PlatformError, match="permission denied"):
-            PlatformClient().modify_configs(
-                [Job(name="job", command="echo")], "eid"
-            )
+        job = Job(
+            name="public-job", command="echo public",
+            resource_config=ResourceConfig(
+                queue_name="Public-Pool-H20", queue_category="public",
+                roles=[RoleConfig(name="Master", replicas=1, accelerator_count=2,
+                                  resource_region="ACCELERATOR_SUITE")],
+                platform_overrides={"customResourceField": "value"},
+            ),
+            run_options=RunOptions(duration_hours=2, usage_desc="benchmark",
+                                   queue_priority_mode="normal"),
+            platform_overrides={"customConfigField": "value"},
+        )
+        PlatformClient().modify_configs(
+            [job], "eid", queue_locations={
+                "QUEUE_CATEGORY_PUBLIC|||Public-Pool-H20||": {
+                    "queue_id": "shared-q", "queue_name": "Public-Pool-H20",
+                    "quota_id": "quota", "shared_quota_id": "shared-quota",
+                    "queue_category": "QUEUE_CATEGORY_PUBLIC",
+                    "cluster_id": "cluster", "zone_id": "zone",
+                }
+            }, experiment_data=self._experiment()
+        )
+        resource = captured["advance_config_infos"][0]["resource_config_list"][0]
+        assert resource["queue_category"] == 1
+        assert resource["shared_quota_id"] == "shared-quota"
+        assert resource["cluster_id"] == "cluster"
+        assert resource["customResourceField"] == "value"
+        assert resource["role_info_list"][0]["resource_request_detail"]["accelerator_count"] == 2
+        assert captured["advance_config_infos"][0]["customConfigField"] == "value"
 
 
 class TestRunConfig:
-    @patch.object(PlatformClient, "job_run")
+    @patch("subprocess.run")
     def test_runs_existing_config_and_parses_id(self, mock_run):
         job_id = "11111111-1111-1111-1111-111111111111"
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout=f"Job {job_id} submitted", stderr=""
-        )
+        mock_run.return_value = MagicMock(returncode=0, stdout=f"Job {job_id} submitted", stderr="")
         assert PlatformClient().run_config("eid", "cfg") == job_id
-        mock_run.assert_called_once_with(exp_id="eid", config_name="cfg")
+        mock_run.assert_called_once_with(
+            ["airsctl", "job", "run", "-e", "eid", "-n", "cfg"],
+            capture_output=True, text=True,
+        )
 
-    @patch.object(PlatformClient, "job_run")
+    @patch("subprocess.run")
     def test_run_failure_raises(self, mock_run):
         mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="failed")
         with pytest.raises(PlatformError, match="failed"):
             PlatformClient().run_config("eid", "cfg")
+
+    @patch("subprocess.run")
+    def test_unparseable_output_raises_instead_of_faking_an_id(self, mock_run):
+        # Regression: the config name used to be returned as the "job ID",
+        # silently corrupting the tracker.
+        mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+        with pytest.raises(PlatformError, match="could not find a job ID"):
+            PlatformClient().run_config("eid", "cfg")
+
+    @patch("subprocess.run")
+    def test_public_queue_options_validated(self, mock_run):
+        with pytest.raises(PlatformError, match="public queue requires"):
+            PlatformClient().run_config("eid", "cfg", queue_category="public")
+        mock_run.assert_not_called()
+
+    @pytest.mark.parametrize("output,expected", [
+        ('{"job_id": "abc"}', "abc"),
+        ('{"data": {"jobId": "nested"}}', "nested"),
+        ("job_id: plain-1", "plain-1"),
+        ("Job 22222222-2222-2222-2222-222222222222 created", "22222222-2222-2222-2222-222222222222"),
+        ("", None),
+        ('{"status": "ok"}', None),
+    ])
+    def test_parse_job_id(self, output, expected):
+        assert PlatformClient._parse_job_id(output) == expected
+
+
+class TestRemoveConfigs:
+    @patch.object(PlatformClient, "experiment_modify")
+    @patch("subprocess.run")
+    def test_removes_named_configs_only(self, mock_run, mock_modify):
+        experiment = {"experiment_id": "eid", "advance_config_infos": [
+            {"config_name": "a"}, {"config_name": "b"}, {"config_name": "c"}]}
+        mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(experiment))
+        captured = {}
+        mock_modify.side_effect = lambda path: captured.update(json.loads(open(path).read()))
+        PlatformClient().remove_configs("eid", {"a", "c"})
+        assert [c["config_name"] for c in captured["advance_config_infos"]] == ["b"]
+
+    @patch.object(PlatformClient, "experiment_modify")
+    @patch("subprocess.run")
+    def test_no_match_no_modify(self, mock_run, mock_modify):
+        experiment = {"experiment_id": "eid", "advance_config_infos": [{"config_name": "a"}]}
+        mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(experiment))
+        PlatformClient().remove_configs("eid", {"zzz"})
+        mock_modify.assert_not_called()
 
 
 class TestFindExperiment:
@@ -562,3 +670,20 @@ class TestFindExperiment:
     def test_non_dict_json_returns_none(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0, stdout='["a"]')
         assert PlatformClient().find_experiment("exp") is None
+
+    @patch("subprocess.run")
+    def test_name_mismatch_returns_none(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps({"experiment_id": "eid-1", "experiment_name": "my-exp-2"}),
+        )
+        assert PlatformClient().find_experiment("my-exp") is None
+
+    @patch("subprocess.run")
+    def test_by_name_caches_detail_for_submit(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(
+            {"experiment_id": "eid-1", "experiment_name": "my-exp", "advance_config_infos": []}))
+        client = PlatformClient()
+        client.find_experiment("my-exp")
+        client.get_experiment("eid-1")
+        assert mock_run.call_count == 1

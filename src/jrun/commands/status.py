@@ -4,11 +4,12 @@ from collections import Counter
 
 import click
 
+from jrun.commands import open_project
 from jrun.formatter import StatusFormatter
 from jrun.platform import PlatformClient
-from jrun.project import Project
+from jrun.project import Project, build_job_url
 from jrun.scheduler import Scheduler
-from jrun.tracking import refresh_job_for_display
+from jrun.tracking import find_tracked_job, refresh_job_for_display
 
 
 @click.command("status")
@@ -17,9 +18,9 @@ from jrun.tracking import refresh_job_for_display
 @click.option("-n", "max_jobs", default=10, help="Max jobs to show (0 for all)")
 def status_cmd(name_or_id, status, max_jobs):
     """Show job status."""
-    project = Project()
+    project = open_project()
     platform = PlatformClient()
-    formatter = StatusFormatter(project)
+    formatter = StatusFormatter()
     tracker = project.load_tracker()
     status_filter = set(status) if status else None
 
@@ -28,10 +29,10 @@ def status_cmd(name_or_id, status, max_jobs):
             _show_search_jobs(project, platform, formatter, tracker, name_or_id, status_filter, max_jobs)
             return
 
-        for jid, info in tracker.get("jobs", {}).items():
-            if jid == name_or_id or info.get("name") == name_or_id:
-                _show_single_job(project, platform, formatter, jid, tracker)
-                return
+        found = find_tracked_job(tracker, name_or_id)
+        if found:
+            _show_single_job(project, platform, formatter, found[0], tracker)
+            return
 
         for sname, sinfo in tracker.get("searches", {}).items():
             if name_or_id.lower() in sname.lower():
@@ -82,11 +83,7 @@ def _show_all_jobs(project: Project, platform: PlatformClient, formatter: Status
         refresh_job_for_display(project, platform, jid, info)
         if status_filter and info.get("status") not in status_filter:
             continue
-        job_urls[jid] = project.build_job_url(
-            jid,
-            platform=info.get("platform"),
-            experiment_name=info.get("experiment_name"),
-        )
+        job_urls[jid] = build_job_url(jid, info.get("platform"), info.get("experiment_name"))
         rows.append((info["name"], info.get("status", "?"), info.get("submitted_at", ""), jid, "job"))
 
     if not rows:
@@ -103,7 +100,7 @@ def _show_all_jobs(project: Project, platform: PlatformClient, formatter: Status
         click.echo(f"\n... showing {max_jobs}/{total} entries (use -n to show more)")
 
     for sname in searches:
-        scheduler = Scheduler(project.jrun_dir, sname, None, "", 0, 0)
+        scheduler = Scheduler(project.jrun_dir, sname)
         pid = scheduler.is_running()
         if pid:
             click.echo(f"\nScheduler active for '{sname}' (pid={pid})")
@@ -116,7 +113,7 @@ def _show_search_jobs(project: Project, platform: PlatformClient, formatter: Sta
     click.echo(f"Config: {search['config_file']}")
     click.echo(f"Submitted: {search['submitted_at']}")
 
-    scheduler = Scheduler(project.jrun_dir, search_name, None, "", 0, 0)
+    scheduler = Scheduler(project.jrun_dir, search_name)
     pid = scheduler.is_running()
     if pid:
         click.echo(f"Scheduler: active (pid={pid})")

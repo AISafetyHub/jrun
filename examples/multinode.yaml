@@ -5,20 +5,13 @@ description: Multi-node job test - 1 master + 2 workers with env vars
 # config). Requires credentials (`jrun login`, or /etc/accesskey on platform
 # pods). See `jrun queues` for queue options.
 experiment:
-  name: jrun_example_multinode
-
+  name: jrun_example
 
 job:
   name: test_multinode
 
   # Docker image the job runs with.
   image: harbor.baai.ac.cn/llm-safety-center/enviroments:agents-v1.0.0
-
-  # (optional) Submit to an existing experiment by ID/name.
-  # If omitted, uses the experiment: block above or the default from
-  # `.jrun/settings.json`.
-  # experiment_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-  # experiment_name: my_other_experiment
 
   commands:
     - cd /workspace
@@ -30,6 +23,11 @@ job:
       MASTER_PORT: "29500",
     }
   resource_config:
+    queue_category: dedicated
+    project_set_name: baai-safety
+    project_name: baai-safety_research
+    region_name: 北京-大兴
+    zone_name: 可用区A
     queue_name: baai-safety_research_yybu-private
     priority: high
     accelerator_model: NVIDIA_A100-SXM4-40GB
@@ -37,9 +35,14 @@ job:
     cpu_cores: 8
     mem_gib: 32
     shared_mem_gib: 16
-    worker:
-      replicas: 2
-      accelerator_count: 2
-      cpu_cores: 16
-      mem_gib: 64
-      shared_mem_gib: 32
+    # Node roles: each inherits the resource fields above; a role's own
+    # values override them. Without roles the job is single-node (one Master).
+    roles:
+      - name: Master
+        replicas: 1
+      - name: Worker
+        replicas: 2
+        accelerator_count: 2
+        cpu_cores: 16
+        mem_gib: 64
+        shared_mem_gib: 32

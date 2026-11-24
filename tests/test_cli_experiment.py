@@ -1,4 +1,3 @@
-import json
 from unittest.mock import MagicMock, patch
 
 from jrun.cli import cli
@@ -15,7 +14,7 @@ class TestExperimentCreate:
         config.write_text(SPEC_CONFIG)
 
         mock_platform = MagicMock()
-        mock_platform.experiment_list.return_value = MagicMock(returncode=1, stdout="", stderr="")
+        mock_platform.find_experiment.return_value = None
         mock_platform_cls.return_value = mock_platform
         mock_api = MagicMock()
         mock_api.find_queue.return_value = SAMPLE_QUEUE
@@ -40,9 +39,7 @@ class TestExperimentCreate:
         config.write_text(SPEC_CONFIG)
 
         mock_platform = MagicMock()
-        mock_platform.experiment_list.return_value = MagicMock(
-            returncode=0, stdout=json.dumps({"experiment_id": "existing-eid"}), stderr=""
-        )
+        mock_platform.find_experiment.return_value = {"experiment_id": "existing-eid"}
         mock_platform_cls.return_value = mock_platform
         mock_api = MagicMock()
         mock_api.find_queue.return_value = SAMPLE_QUEUE
@@ -61,6 +58,7 @@ class TestExperimentCreate:
         monkeypatch.chdir(tmp_path)
         config = tmp_path / "job.yaml"
         config.write_text(SPEC_CONFIG)
+        mock_platform_cls.return_value.find_experiment.return_value = None
         mock_api = MagicMock()
         mock_api.find_queue.return_value = None
         mock_api.list_queues.return_value = [SAMPLE_QUEUE]
@@ -131,17 +129,13 @@ class TestExperimentJobs:
 
     @patch("jrun.commands.experiment.PlatformAPI")
     @patch("jrun.commands.experiment.PlatformClient")
-    def test_links_when_project_has_platform_ids(self, mock_platform_cls,
-                                                 mock_api_cls, runner,
-                                                 tmp_path, monkeypatch):
-        import json as _json
-        jrun_dir = tmp_path / ".jrun"
-        jrun_dir.mkdir()
-        (jrun_dir / "settings.json").write_text(_json.dumps({
-            "platform": {"projId": "p1", "projsetId": "ps1", "userId": "u1"},
-        }))
+    def test_links_from_experiment_platform_ids(self, mock_platform_cls,
+                                                mock_api_cls, runner,
+                                                tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        mock_platform_cls.return_value.find_experiment.return_value = self.EXP
+        mock_platform_cls.return_value.find_experiment.return_value = {
+            **self.EXP, "proj_id": "p1", "projset_id": "ps1", "creator_id": "u1",
+        }
         mock_api_cls.return_value.experiment_jobs_all.return_value = self.JOBS
 
         result = runner.invoke(cli, ["experiment", "jobs", "my-exp"])
