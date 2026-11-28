@@ -44,6 +44,10 @@ Identify the requested operation and its scope:
   use `queue_name: auto` (section 3) instead of picking one queue yourself.
 - **Observe or inspect**: use tracked-job status, experiment listing, queue
   capacity, or GPU usage.
+- **Public pool without public permission**: if the user's account cannot
+  submit to the public pool but a jrun remote-submission service is
+  available, add a top-level `remote:` block (see "Remote submission" below);
+  do not ask for or use someone else's AK/SK.
 - **Stop or remove**: resolve the exact job/search and explain the cleanup
   scope before asking for confirmation.
 
@@ -87,7 +91,9 @@ jrun queues --ids
 `jrun queues` lists each shared pool under both `public` and `idle` (same pool,
 different submission mode and RUN/LIMIT). With `queue_name: auto` there is no
 need to choose a queue from this list first; use it to explain a placement
-(compare the FREE and RUN/LIMIT columns). `--proj-id`/`--projset-id` on
+(compare the FREE, RUN/LIMIT, and WAITING columns). WAITING counts jobs
+already queued ahead of a new one; a queue with free cards but WAITING > 0
+will not start a new job right away (FIFO scheduling). `--proj-id`/`--projset-id` on
 `queues`, `gpu-usage`, `experiment jobs`, and `experiment delete` default to no
 project and an auto-detected joined project set.
 
@@ -120,7 +126,9 @@ only warns when it is missing). jrun finds the experiment by exact name or
 creates it. Only `name` is required. Optional job defaults are `image`,
 `image_region`, `project_set_name`, `project_name`, `region_name`,
 `zone_name`, `queue_name`, and `queue_category`; experiment-level settings
-include `description`, `train_frame`, `restart_policy`, and `storage_info`.
+include `description`, `train_frame`, `restart_policy`, and `mounts`
+(`{home, project, projset}`: `rw`/`ro`/`false`, default all `rw`; raw
+`storage_info` is rejected).
 Job-level values always override the experiment defaults. When the experiment
 must be created, jrun builds the placeholder config from the first job's image
 and resolved resource names.
@@ -162,7 +170,9 @@ names (`project_set_name`, `project_name`, `region_name`, `zone_name`) filter
 the candidate queues. Lists require `queue_name: auto`; roles of an auto job
 must not override the accelerator fields; a job's cards are
 `accelerator_count` x total role replicas. If `public` is listed,
-`run_options` must satisfy public-queue requirements. Details, placement
+`run_options` must satisfy public-queue requirements. Queues with jobs
+already waiting ahead (FIFO) are not used to start a job immediately, even
+when they show free cards. Details, placement
 rules, and an example are in
 [references/config-patterns.md](references/config-patterns.md).
 
@@ -177,6 +187,33 @@ When writing an auto config:
   `$$JRUN_ACCELERATOR_COUNT`, `$$JRUN_ACCELERATOR_MODEL`, `$$JRUN_QUEUE_NAME`.
 - `cpu_cores`/`mem_gib`/`shared_mem_gib` are shared by every pair; size them for
   the largest pair and say so.
+
+#### Remote submission
+
+A top-level `remote:` block sends some jobs to a jrun remote-submission
+service, which submits them with its own account (typically one allowed to use
+the public pool):
+
+```yaml
+remote:
+  url: https://jrun-svc.example.com   # ask the user; never guess the URL
+  categories: [public]                # default: only public jobs go remote
+```
+
+- Routing happens after auto placement: a job whose final category is listed
+  goes remote, every other job is submitted locally. Dry-run shows a `Route:`
+  line per job; show it to the user.
+- Remote jobs need `project_set_name` (job or experiment level). The service
+  checks the user's own token: the account must be active, must have joined
+  that project set, and must see the target pool as idle.
+- The service only accepts a restricted config. It rejects
+  `platform_overrides`, `code`/`git_*`, `dataset`, `model_storage_*`, and
+  `image_region: PRIVATE`. It names the experiment `<alias>-<name>` and turns
+  `mounts.home` off. Expect remote jobs not to see the user's home directory;
+  keep code and data under project or projset storage.
+- Remote jobs are tracked with the service URL. `jrun job status/stop/remove`
+  work on them through the service; the user's own key cannot stop them
+  directly on the platform.
 
 ### 4. Preview and validate
 
@@ -391,6 +428,15 @@ operators. Prefer environment entries over credentials embedded in commands.
   `jrun queues`; offer adding `dedicated` or waiting, as in section 5.
 - **Old job could not be stopped on overwrite**: check it with
   `jrun job status <name>`, stop it explicitly, then resubmit.
+- **Remote service errors**: HTTP 401 means the user's own credentials are
+  invalid or expired. HTTP 403 explains which check failed: project set not
+  served or not joined, pool not visible, or a field that is not allowed.
+  Fix the config or ask the service operator; do not work around it. If the
+  service is unreachable, status shows a warning and remote jobs keep their
+  last known status.
+- **Running jrun outside a jiuding pod**: set
+  `JRUN_AIRSCTL_GATEWAY=http://platform-multi.baai.ac.cn` so airsctl goes
+  through the public gateway with the job's project context.
 
 ## Completion checklist
 

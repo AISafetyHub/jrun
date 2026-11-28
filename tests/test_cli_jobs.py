@@ -257,3 +257,107 @@ class TestStopFilters:
         result = runner.invoke(cli, ["job", "stop", "x"])
         assert result.exit_code == 1
         assert "jrun init" in result.output
+
+
+# --- remote jobs and --json ---------------------------------------------------------
+
+import pytest  # noqa: E402
+
+from tests.remote_fakes import URL, FakeRemote, registry  # noqa: E402
+
+
+@pytest.fixture
+def fake_remote():
+    fake = FakeRemote()
+    with patch("jrun.commands.jobs.RemoteRegistry", return_value=registry(fake)):
+        yield fake
+
+
+def _remote_tracker(project_dir):
+    _write_tracker(project_dir, {
+        "searches": {"s": {"job_ids": ["r-1", "loc"], "config_file": "c", "submitted_at": "t",
+                           "experiment_id": "eid"}},
+        "jobs": {
+            "r-1": {"name": "pub", "search_name": "s", "status": "Running", "remote": URL},
+            "loc": {"name": "idle", "search_name": "s", "status": "Running",
+                    "experiment_id": "eid"}}})
+
+
+class TestRemoteJobs:
+    @patch("jrun.commands.jobs.PlatformClient")
+    def test_stop_search_routes_remote_job_to_service(self, mock_platform_cls, runner,
+                                                      project_dir, monkeypatch, fake_remote):
+        monkeypatch.chdir(project_dir)
+        _remote_tracker(project_dir)
+        fake_remote.rows = [{"job_id": "r-1", "name": "pub", "status": "Running"}]
+        client = MagicMock()
+        client.get_job_status.return_value = "Running"
+        mock_platform_cls.return_value = client
+        result = runner.invoke(cli, ["job", "stop", "s"])
+        assert result.exit_code == 0, result.output
+        assert fake_remote.stopped == ["r-1"]
+        client.job_stop.assert_called_once_with("loc")
+
+    @patch("jrun.commands.jobs.PlatformClient")
+    def test_stop_json(self, mock_platform_cls, runner, project_dir, monkeypatch, fake_remote):
+        monkeypatch.chdir(project_dir)
+        _remote_tracker(project_dir)
+        fake_remote.rows = [{"job_id": "r-1", "name": "pub", "status": "Running"}]
+        mock_platform_cls.return_value = MagicMock()
+        result = runner.invoke(cli, ["job", "stop", "r-1", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout) == {
+            "results": {"r-1": {"ok": True, "name": "pub", "status": "Running"}}}
+
+    @patch("jrun.commands.jobs.PlatformClient")
+    def test_stop_json_unknown_job(self, mock_platform_cls, runner, project_dir, monkeypatch,
+                                   fake_remote):
+        monkeypatch.chdir(project_dir)
+        _remote_tracker(project_dir)
+        result = runner.invoke(cli, ["job", "stop", "nope", "--json"])
+        assert result.exit_code == 0
+        assert json.loads(result.stdout)["results"]["nope"]["missing"] is True
+
+    @patch("jrun.commands.jobs.PlatformClient")
+    def test_remove_search_mixes_service_and_local(self, mock_platform_cls, runner,
+                                                   project_dir, monkeypatch, fake_remote):
+        monkeypatch.chdir(project_dir)
+        monkeypatch.setattr("jrun.tracking.time.sleep", lambda s: None)
+        _remote_tracker(project_dir)
+        fake_remote.rows = [{"job_id": "r-1", "name": "pub", "status": "Running"}]
+        client = MagicMock()
+        client.get_job_status.side_effect = ["Running", "Stopped"]
+        mock_platform_cls.return_value = client
+        result = runner.invoke(cli, ["job", "remove", "s", "--json"])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert sorted(data["removed"]) == ["loc", "r-1"]
+        assert fake_remote.removed == ["r-1"]
+        client.job_cancel.assert_called_once_with("loc")
+        tracker = json.loads((project_dir / ".jrun" / "jobs.json").read_text())
+        assert tracker == {"searches": {}, "jobs": {}}
+
+    @patch("jrun.commands.jobs.PlatformClient")
+    def test_remove_json_unknown_is_missing(self, mock_platform_cls, runner, project_dir,
+                                            monkeypatch, fake_remote):
+        monkeypatch.chdir(project_dir)
+        _remote_tracker(project_dir)
+        result = runner.invoke(cli, ["job", "remove", "nope", "--json"])
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == {"removed": [], "still_active": {},
+                                             "missing": ["nope"]}
+
+    @patch("jrun.commands.jobs.PlatformClient")
+    def test_remove_still_active_remote_job_kept(self, mock_platform_cls, runner, project_dir,
+                                                 monkeypatch, fake_remote):
+        monkeypatch.chdir(project_dir)
+        _remote_tracker(project_dir)
+        fake_remote.rows = [{"job_id": "r-1", "name": "pub", "status": "Running"}]
+        fake_remote.remove_result = {"removed": [], "still_active": {"r-1": "Running"},
+                                     "missing": []}
+        mock_platform_cls.return_value = MagicMock()
+        result = runner.invoke(cli, ["job", "remove", "r-1"])
+        assert result.exit_code == 1
+        assert "still Running" in result.output
+        tracker = json.loads((project_dir / ".jrun" / "jobs.json").read_text())
+        assert "r-1" in tracker["jobs"]

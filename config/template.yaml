@@ -23,7 +23,7 @@ description: My experiment description
 # placeholder config). Requires credentials (`jrun login`).
 # Besides its name, the block holds defaults for jobs (image, image_region,
 # queue and location names) and experiment-level settings (description,
-# train_frame, restart_policy, storage_info, ...). A job-level value always
+# train_frame, restart_policy, mounts, ...). A job-level value always
 # wins over the experiment default.
 # On each submit, jrun replaces this experiment's config list with the selected
 # current jobs; the local .jrun/jobs.json file retains job history and IDs.
@@ -49,11 +49,32 @@ experiment:
   # description: Created by jrun
   # train_frame: PyTorch             # PyTorch/TensorFlow/Paddle/MPI/FlagScale
   # restart_policy: Never
-  # storage_info: []
+  # Storage mounted into every job (default: all three, read-write).
+  # Each value is rw, ro, or false (not mounted).
+  # mounts:
+  #   home: rw        # /home/<user>
+  #   project: rw     # /share/project
+  #   projset: rw     # /share/projset
   # native_cluster: default-cluster
   # profiler_info: {enabled: false, level: typical}
   # model_storage_info: {}
   # platform_overrides: {}            # raw experiment fields for new platform versions
+
+# ==========================================================================
+# Remote submission (optional)
+# Jobs whose queue category (after auto placement) is listed here are sent
+# to a jrun remote-submission service, which submits them with its own
+# account (e.g. a key allowed to use the public pool); all other jobs are
+# submitted locally as usual. The service checks your identity with your own
+# credentials and that you can see the target project set and queue. Jobs
+# sent there need project_set_name; their experiment is named
+# "<your alias>-<experiment name>" on the service and mounts.home is off.
+# `jrun job status/stop/remove` reach those jobs through the service.
+# See docs/remote-service.md.
+# ==========================================================================
+# remote:
+#   url: http://jrun-svc.example.com:8080   # or $JRUN_REMOTE_URL
+#   categories: [public]                     # default: public only
 
 # ==========================================================================
 # Grid Search
@@ -143,7 +164,9 @@ search:
       # position and in preference order (a scalar count applies to every model).
       # queue_category may then be a preference-ordered list. On submit jrun
       # reads free cards and public/idle submit slots and picks a queue per
-      # job; `--dry-run` previews the placement. Placed jobs get
+      # job; `--dry-run` previews the placement. A FIFO queue that already has
+      # jobs waiting is not used to "start now" even if it shows free cards
+      # (see the WAITING column of `jrun queues`). Placed jobs get
       # JRUN_QUEUE_NAME / JRUN_ACCELERATOR_MODEL / JRUN_ACCELERATOR_COUNT envs
       # (use $$JRUN_ACCELERATOR_COUNT in commands). Location names above filter
       # the candidate queues; roles must not override the accelerator fields.

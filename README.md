@@ -52,9 +52,10 @@ The command layout mirrors this: `jrun submit` creates jobs, `jrun job ...` mana
 jrun init                     # create .jrun/ in the current directory
 jrun login                    # store platform AK/SK in ~/.jrun/auth.json (prompts for both)
 jrun login --ak <AK> --sk <SK>  # non-interactive
+jrun whoami                   # account, identity type, and joined project sets (--json available)
 ```
 
-`jrun init` only creates the `.jrun/` directory (its `settings.json` is an empty marker; it binds no experiment). All `jrun` commands locate it by walking up from the current working directory. `jrun login` exchanges your AK/SK for a token and verifies it; the REST API is needed for experiment creation, queue resolution, and queue queries. Credentials resolve in order: `AIRS_AK`/`AIRS_SK` env vars → `~/.jrun/auth.json` → `/etc/accesskey/{user-ak,user-sk}` (base64-encoded, automatically mounted on jiuding platform pods) → airsctl's cached token (`/tmp/.airs/.token`). On platform pods, credentials are picked up automatically, so login is optional there.
+`jrun init` only creates the `.jrun/` directory (its `settings.json` is an empty marker; it binds no experiment). All `jrun` commands locate it by walking up from the current working directory. `jrun login` exchanges your AK/SK for a token and verifies it; the REST API is needed for experiment creation, queue resolution, and queue queries. Credentials resolve in order: a ready token in `AIRS_TOKEN` → `AIRS_AK`/`AIRS_SK` env vars → `~/.jrun/auth.json` → `/etc/accesskey/{user-ak,user-sk}` (base64-encoded, automatically mounted on jiuding platform pods) → airsctl's cached token (`/tmp/.airs/.token`). On platform pods, credentials are picked up automatically, so login is optional there.
 
 ### 2. Write a Config
 
@@ -65,7 +66,17 @@ jrun template                    # print to stdout
 jrun template -f config/my.yaml  # write to file
 ```
 
-Every config that submits to the platform needs a top-level `experiment:` block with at least `name:`. jrun looks the experiment up by exact name and creates it via the platform API if missing (using the first job's image and queue for the placeholder config). The block can also carry defaults for jobs (`image`, `image_region`, `queue_name`, `queue_category`, `project_set_name`, `project_name`, `region_name`, `zone_name`) and experiment-level settings (`description`, `train_frame`, `restart_policy`, `storage_info`, ...). A job-level value always wins over the experiment default. `--dry-run` only warns when the block is missing; a real submit fails.
+Every config that submits to the platform needs a top-level `experiment:` block with at least `name:`. jrun looks the experiment up by exact name and creates it via the platform API if missing (using the first job's image and queue for the placeholder config). The block can also carry defaults for jobs (`image`, `image_region`, `queue_name`, `queue_category`, `project_set_name`, `project_name`, `region_name`, `zone_name`) and experiment-level settings (`description`, `train_frame`, `restart_policy`, `mounts`, ...). A job-level value always wins over the experiment default. `--dry-run` only warns when the block is missing; a real submit fails.
+
+`mounts` controls the storage mounted into every job of the experiment: `home` (`/home/<user>`), `project` (`/share/project`), and `projset` (`/share/projset`), each `rw`, `ro`, or `false` (not mounted). A directory you leave out is mounted `rw`, and without `mounts` jrun keeps the platform default (all three `rw`). The setting applies when the experiment is created and on every submit, so changing it in the YAML changes later jobs. The old raw `storage_info` list is rejected; a raw list can still go under `platform_overrides`.
+
+```yaml
+experiment:
+  name: my-exp
+  mounts:
+    project: false   # don't mount /share/project
+    projset: ro      # /share/projset read-only
+```
 
 **Grid search** (`config/search.yaml`):
 
@@ -260,9 +271,11 @@ run_options:                          # required because public is allowed
 
 On submit, jrun reads every candidate queue's free cards and the project set's remaining public/idle submit slots (the per-project-set limit minus running and queueing jobs, the RUN/LIMIT column of `jrun queues`), then places the jobs being submitted in order:
 
-1. **Starts now**: the first candidate, by category preference, then pair preference, then most free cards, that has enough free cards (`accelerator_count` × total role replicas) and, for public/idle, a remaining submit slot.
-2. **Queued on the platform**: a job that fits nowhere goes to a dedicated queue if `dedicated` is listed (dedicated queues accept queued submissions), otherwise to a public/idle queue that still has a submit slot.
+1. **Starts now**: the first candidate, by category preference, then pair preference, then most free cards, that has enough free cards (`accelerator_count` × total role replicas), no jobs waiting ahead of it (see below), and, for public/idle, a remaining submit slot.
+2. **Queued on the platform**: a job that fits nowhere goes to a dedicated queue if `dedicated` is listed (dedicated queues accept queued submissions), otherwise to a public/idle queue that still has a submit slot. Among those, the queue with the fewest jobs waiting ahead wins, then the one with the most free cards.
 3. **Waits for a slot**: with no public/idle slot left, the job's config is installed on its preferred queue and the background scheduler runs it once a slot frees up (with or without `parallel_trials`). A single `job:` that would have to wait fails with an error instead.
+
+**FIFO queues.** A queue can show free cards while jobs already wait in it (e.g. a waiting job needs more cards than are free). Under first-in-first-out scheduling nothing behind that job starts, so jrun does not count such a queue as "starts now". Dedicated queues count as FIFO unless their schedule strategy is Traverse (Smart is treated as FIFO). Shared pools are always FIFO: a public job (high priority) waits behind waiting public jobs, an idle job (low priority) behind waiting public and idle jobs, counted across all project sets. If the waiting count cannot be read, jrun falls back to free cards only. The WAITING column of `jrun queues` shows these counts, and the placement preview prints `N waiting ahead`.
 
 Public and idle are the same physical pools, so free cards are counted once while submit slots are counted per mode. Model names match exactly (case-insensitive); queues whose total capacity is below the job's cards are never chosen. Each placed job becomes an ordinary job on the chosen queue and gets `JRUN_QUEUE_NAME`, `JRUN_ACCELERATOR_MODEL`, and `JRUN_ACCELERATOR_COUNT` environment variables, so commands can adapt (e.g. `echo $$JRUN_ACCELERATOR_MODEL`); a plain `torchrun` without `--nproc_per_node` already starts one process per visible GPU (see [Remote Job Environment Variables](#remote-job-environment-variables)). `--dry-run` previews the placement with read-only platform queries; the real submit places again with the capacity at that moment. Lists in `accelerator_model`/`accelerator_count`/`queue_category` require `queue_name: auto` (which can also be set on the `experiment:` block), and roles must not override the accelerator fields of an auto job. The queue of a waiting job is fixed at submit time.
 
@@ -285,6 +298,12 @@ jrun submit config/search.yaml --overwrite
 
 # Only overwrite jobs with specific status
 jrun submit config/search.yaml -o -s Failed -s Stopped
+
+# Only submit some jobs of a grid (repeatable)
+jrun submit config/search.yaml --only my_eval_lr0.01
+
+# Machine-readable result on stdout (no prompts; messages go to stderr)
+jrun submit config/search.yaml --dry-run --json
 ```
 
 When a job name already exists in the tracker, jrun prompts to overwrite or skip. Use `--overwrite` (`-o`) to auto-overwrite, optionally filtered by `--status` (`-s`).
@@ -307,6 +326,18 @@ that is intentional. With `parallel_trials`, all selected configs are
 installed by the initial modify and the background scheduler only runs
 pending configs. If the experiment already has 100 or more configs, jrun
 warns and asks before continuing.
+
+#### Submitting public jobs through a remote service
+
+If your account may submit to dedicated and idle queues but not to the public pool, a jrun remote-submission service (see [Remote Submission Service](#remote-submission-service)) can submit the public jobs for you. Opt in per config with a top-level `remote:` block:
+
+```yaml
+remote:
+  url: https://jrun-svc.example.com   # or $JRUN_REMOTE_URL
+  categories: [public]                # default: only public jobs go remote
+```
+
+After auto placement, each job whose final queue category is listed goes to the service, and every other job is submitted locally as usual. `--dry-run` shows a `Route:` line per job. Jobs sent to the service need `project_set_name`. The service verifies your identity with your own credentials, and checks that you have joined the project set and can see the target pool (as idle). It then submits under its own account into the experiment `<your alias>-<name>`, with `mounts.home` off. Those jobs are tracked locally with the service URL, so `jrun job status / stop / remove` reach them through the service. See `examples/remote-public.yaml` and `docs/remote-service.md`.
 
 If the experiment doesn't exist yet, jrun asks to create it (skip the prompt with `-y`). To create the experiment without submitting anything:
 
@@ -335,7 +366,7 @@ jrun gpu-usage --cluster-id <ID> --zone-id <ID>   # filter by cluster / zone (re
 jrun gpu-usage --owner my-workspace -n 20         # filter by owner, show 20 rows (default 50)
 ```
 
-Public and idle are two submission modes on the same shared pools, so `jrun queues` lists each shared pool once under `public` and once under `idle`, each with its own RUN/LIMIT (running jobs vs. per-project-set limit). `--proj-id` / `--projset-id` (also on `gpu-usage`, `experiment jobs`, and `experiment delete`) set the project / project-set headers; by default no project is sent and the project set is auto-detected from the account's joined project sets.
+Public and idle are two submission modes on the same shared pools, so `jrun queues` lists each shared pool once under `public` and once under `idle`, each with its own RUN/LIMIT (running jobs vs. per-project-set limit). WAITING is the number of jobs waiting ahead of a new one: for dedicated queues, Pending/Scheduling jobs in the queue (`-` for Traverse queues, where waiting jobs don't block); for shared pools, waiting jobs across all project sets (public: public jobs; idle: public + idle jobs). A queue with free cards and WAITING > 0 will not start a new job right away. `--proj-id` / `--projset-id` (also on `gpu-usage`, `experiment jobs`, and `experiment delete`) set the project / project-set headers; by default no project is sent and the project set is auto-detected from the account's joined project sets.
 
 ### 5. Check Status
 
@@ -354,9 +385,14 @@ jrun job status <job-name-or-id>
 # Only show jobs with specific status
 jrun job status -s Running
 jrun job status my_eval -s Failed -s Stopped
+
+# Refreshed jobs as JSON (all matches)
+jrun job status my_eval --json
 ```
 
-Status output includes colored status indicators and clickable platform links (when platform IDs are available).
+Status output includes colored status indicators and clickable platform links (when platform IDs are available). Jobs submitted through a remote service are refreshed from that service (one call per service).
+
+`jrun queues`, `jrun job stop`, and `jrun job remove` accept `--json` too; the JSON shapes are documented in `docs/remote-service.md`.
 
 ### 6. Manage Jobs
 
@@ -432,7 +468,8 @@ The platform provides no job-ID, queue, or accelerator variables, which is why j
 | `experiment.region_name` / `zone_name` / `queue_name` | experiment | Default region, zone, and queue names |
 | `experiment.queue_category` | experiment | Default queue type: `dedicated`, `public`, or `idle` (a preference list with `queue_name: auto`) |
 | `experiment.description` | experiment | Description used when jrun creates the experiment |
-| `experiment.train_frame` / `restart_policy` / `storage_info` / `native_cluster` / `profiler_info` / `model_storage_info` | experiment | Experiment-level settings written to the experiment on submit |
+| `experiment.train_frame` / `restart_policy` / `native_cluster` / `profiler_info` / `model_storage_info` | experiment | Experiment-level settings written to the experiment on submit |
+| `experiment.mounts` | experiment | `{home, project, projset}`: `rw` / `ro` / `false`; storage mounted into jobs (default: all `rw`) |
 | `name` | job / job_template | Job name (supports `{param}` and `{auto:Ns}`) |
 | `image` | job / job_template | Docker image the job runs with (supports `{param}` in search); overrides `experiment.image` |
 | `image_region` | job / job_template | Image repo type: `PUBLIC` (default) or `PRIVATE`, case-insensitive |
@@ -445,7 +482,7 @@ The platform provides no job-ID, queue, or accelerator variables, which is why j
 | `selected_nodes` | job / job_template, resource_config | Pin the job to specific nodes |
 | `platform_overrides` | experiment / job / resource_config / role | Raw fields for newer Jiuding API versions (the only way to pass unmodelled job fields) |
 | `resource_config` | job / job_template | Resource allocation; overrides experiment defaults |
-| `resource_config.queue_name` | resource_config | Queue to submit into (resolved via API; `local` runs locally; `auto` picks a queue by free cards) |
+| `resource_config.queue_name` | resource_config | Queue to submit into (resolved via API; `local` runs locally; `auto` picks a queue by free cards and waiting jobs) |
 | `resource_config.queue_category` | resource_config | `dedicated` (default), `public`, or `idle` shared queue category; with `queue_name: auto` a preference-ordered list |
 | `resource_config.project_set_name` / `project_name` | resource_config | Project path used to resolve the queue |
 | `resource_config.region_name` / `zone_name` | resource_config | Region and availability-zone names used to resolve the queue |
@@ -471,6 +508,29 @@ The platform provides no job-ID, queue, or accelerator variables, which is why j
 | `search.max_trials` | search | Max number of parameter combinations (default 9999) |
 | `search.parallel_trials` | search | Max concurrent jobs; pending configs are run by a scheduler |
 | `search.poll_interval` | search | Scheduler polling interval in seconds (default 30) |
+| `remote.url` | remote | jrun remote-submission service URL; jobs routed there are submitted by the service |
+| `remote.categories` | remote | Queue categories routed to the service, judged after auto placement (default `[public]`) |
+
+## Remote Submission Service
+
+`server/` contains `jrun-server`, a separate package with its own Dockerfile and `docker-compose.yml`. It runs with one account's AK/SK, for example a key that may use the public pool. It submits jobs for verified jiuding users by driving the `jrun` CLI (`--json`) in a private workspace per caller.
+
+```bash
+cd server
+cp /client-tools/airsctl ./airsctl   # from a jiuding pod
+cp .env.example .env                 # AIRS_AK, AIRS_SK, JRUN_SERVE_PROJECT_SETS, optional JRUN_SERVE_USERS
+docker compose up -d --build
+```
+
+Access checks:
+- **Identity:** the caller's token must belong to an active account (and match `JRUN_SERVE_USERS` when that is set).
+- **Project set:** it must be allowlisted and joined by the caller.
+- **Pool:** the caller must see the target pool as idle.
+- **Config:** the config is rebuilt from an allowlist (no raw platform overrides, code/dataset/model-storage fields, or private images), and `$` is re-escaped so the service's own environment can never be substituted.
+
+Callers send their 2-hour token, so serve it behind TLS. Details: `docs/remote-service.md`.
+
+jrun itself can also run outside jiuding pods. Set `JRUN_AIRSCTL_GATEWAY=http://platform-multi.baai.ac.cn` and every airsctl call gets `-u <gateway>` plus the project context (`-P/-p`) of the job's queue. See `docs/airsctl.md`.
 
 ## Project Structure
 

@@ -26,4 +26,4 @@ jrun = "jrun.cli:cli"
 testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/jrun"]
+packages = ["jrun"]

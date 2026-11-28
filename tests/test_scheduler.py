@@ -273,3 +273,21 @@ class TestSchedulerSlots:
         scheduler.run_loop()
         scheduler.platform.run_config.assert_called_once()
         assert any("trying anyway" in str(c) for c in scheduler._log.call_args_list)
+
+
+class TestAirsctlContext:
+    def test_context_persisted_and_applied(self, tmp_path, monkeypatch):
+        import json
+        jrun_dir = tmp_path / ".jrun"
+        jrun_dir.mkdir()
+        scheduler = Scheduler(jrun_dir, "s", "exp", "eid", 0, 5, airsctl_context=("p1", "ps1"))
+        assert scheduler.platform.context == ("p1", "ps1")
+        with patch("subprocess.Popen") as popen:
+            popen.return_value.pid = 123
+            scheduler.start([])
+        args = json.loads(scheduler._args_file.read_text())
+        assert args["airsctl_context"] == ["p1", "ps1"]
+
+    def test_no_context_by_default(self, scheduler):
+        assert scheduler.airsctl_context is None
+        assert scheduler.platform.context == (None, None)

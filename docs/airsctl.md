@@ -1,5 +1,9 @@
 # 命令行工具说明文档
 
+> jrun 中 airsctl 的原始调用都在 `jrun/jiuding/airsctl.py`（`Airsctl`，每个
+> 子命令一个方法，含 `Unauthenticated` 重试）；实验文档和 config 工作集的处理在
+> `jrun/platform.py`（`PlatformClient(Airsctl)`）。修改 airsctl 调用前先看本文档。
+
 平台支持用户 SSH 登录开发环境后，使用 `airsctl` 命令进行一系列操作，常用的命令如下：
 
 ### 1. 基础常用命令
@@ -46,6 +50,33 @@
 
 `jrun queues` 同时读取专属队列和 `/api/v1/shared-queue/list` 的共享资源池，展示每种卡型的总量、已用量和空闲量。公共和闲时是同一批共享资源池的两种提交方式，所以每个共享资源池会在 `public` 和 `idle` 下各出现一次，RUN/LIMIT 分别来自 `shared-queue/job-count` 和 `shared-queue/config`。
 
+### 非九鼎机器上使用 airsctl（off-platform）
+
+在九鼎 pod 上，airsctl 从 `/etc/downwardapi/annotations` 读取集群内 endpoint
+（`airs-center-endpoint`）、网关（`gateway-base-url`）和默认项目上下文
+（`proj.baai.ac.cn/id` / `projset.baai.ac.cn/id`），从 `/etc/accesskey/{user-ak,user-sk}`
+（base64）或 `/tmp/.airs/.token` 读取凭据。每个子命令还接受全局参数：
+
+* `-u, --gateway-base-url`：网关地址（公网 `http://platform-multi.baai.ac.cn`）。
+* `-d, --airs-end-point`：集群内 airs-center endpoint。
+* `-P, --project-set-id` / `-p, --project-id`：项目集 / 项目上下文。
+* `-t, --user-token`：用户 token。
+
+2026-11-27 在 pod 上实测（`-d 127.0.0.1:1` 使集群内 endpoint 不可达）：`experiment
+list/modify`、`job run/list/stop/cancel` 经 `-u` 网关全部成功，因此不需要集群内
+endpoint；`-P`/`-p` 会覆盖 annotations 中的项目上下文（错误的项目集返回 403，错误的
+项目返回空列表，说明实验列表按项目隔离）；`-t` 在存在 `/etc/accesskey` 或 token 缓存时
+**被忽略**（伪造的 token 仍然成功），所以不要依赖它。
+
+jrun 的做法（`jiuding/airsctl.py`）：设置环境变量 `JRUN_AIRSCTL_GATEWAY` 后，每次调用
+追加 `-u <gateway>`，并在有上下文时追加 `-P <projset> -p <project>`。上下文来自
+`Airsctl.set_context`（submit 时取第一个任务解析出的队列位置，scheduler 参数中持久化
+`airsctl_context`），或环境变量 `JRUN_AIRSCTL_PROJSET_ID` / `JRUN_AIRSCTL_PROJ_ID`
+（默认值）。未设置 `JRUN_AIRSCTL_GATEWAY` 时（pod 上）不追加任何参数，行为不变。
+凭据仍由 airsctl 自己读取：远程提交服务的容器在启动时把 AK/SK 写入
+`/etc/accesskey`，并写一个只含 `gateway-base-url`（及可选默认项目）的 annotations
+文件，模拟 pod 环境（`server/docker-entrypoint.sh`，见 `docs/remote-service.md`）。
+
 ---
 
 ### 2. 更多命令和参数详情
@@ -78,3 +109,4 @@
 * `jrun job remove` 先对仍在进行中的 job 调用 `job stop` 并轮询（最多 60 秒）直到其结束，再调用 `job cancel` 归档并删除 config；按上面的说明，`job cancel` 只对已结束的 job 生效；以前 remove 只调用 cancel，Pending/Running 的 job 在平台上会继续运行。等待后仍未结束的 job 保留在 `.jrun/jobs.json` 中。
 * modify 中删除 config 不会主动停止已经启动的旧 job；但 jrun 覆盖同名任务时，会在 modify 之前先对仍在运行/排队的旧 job 调用 `airsctl job stop`（scheduler 持有的 `queued-*` 记录只在本地标记为 `Stopped`；平台上的 `Pending`/`Approving` job 同样会调用 `job stop`，已结束的 job 不处理）。网格搜索中某个旧 job 停止失败时只跳过该任务；单任务停止失败则中止提交。jrun 的 job ID、状态和覆盖历史以本地 `.jrun/jobs.json` 为准。
 * `airsctl experiment list -e/-N` 返回的是裸的 snake_case 文档（如 `experiment_id`、`advance_config_infos`），jrun 的 `platform.py` 只按 snake_case 解析；按名称查找实验时要求名称精确匹配。
+* 实验文档的 `storage_info` 是挂载到任务中的存储目录，例如 `[{"directory_type": 5, "access_mode": 1, "user_id": <int>, "medium": 1}, {"directory_type": 4, ...}, {"directory_type": 2, ...}]`（5 = `/home/<用户>`、4 = `/share/project`、2 = `/share/projset`；`access_mode` 1 = 读写、0 = 只读）。YAML 写了 `experiment.mounts` 时，jrun 在每次 `experiment modify` 前按它重写该列表（沿用已有条目的 `user_id`/`medium`），否则不改动。详见 `docs/platform-api.md` §7。

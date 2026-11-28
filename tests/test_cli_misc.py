@@ -42,7 +42,7 @@ class TestInit:
 class TestLogin:
     @patch("jrun.commands.misc.PlatformAPI")
     def test_login_saves_auth(self, mock_api_cls, runner, tmp_path, monkeypatch):
-        monkeypatch.setattr("jrun.api.DEFAULT_AUTH_FILE", tmp_path / ".jrun" / "auth.json")
+        monkeypatch.setattr("jrun.jiuding.rest.DEFAULT_AUTH_FILE", tmp_path / ".jrun" / "auth.json")
         mock_api = MagicMock()
         mock_api.get_userinfo.return_value = {"data": {"alias": "yzh"}}
         mock_api_cls.return_value = mock_api
@@ -72,3 +72,36 @@ class TestLogin:
         from jrun.template import TEMPLATE_CONTENT
         repo_root = Path(__file__).resolve().parent.parent
         assert (repo_root / "config" / "template.yaml").read_text() == TEMPLATE_CONTENT
+
+
+class TestWhoami:
+    INFO = {"id": "42", "alias": "intern1", "real_name": "实习生", "identity_type": "院外",
+            "active": True, "projsets": [{"id": "ps-1", "name": "baai-safety"}]}
+
+    @patch("jrun.commands.misc.PlatformAPI")
+    def test_text(self, mock_api_cls, runner):
+        mock_api_cls.return_value.whoami.return_value = self.INFO
+        result = runner.invoke(cli, ["whoami"])
+        assert result.exit_code == 0
+        assert "intern1 (id=42, 院外)" in result.output
+        assert "baai-safety (ps-1)" in result.output
+
+    @patch("jrun.commands.misc.PlatformAPI")
+    def test_json(self, mock_api_cls, runner):
+        import json
+        mock_api_cls.return_value.whoami.return_value = self.INFO
+        result = runner.invoke(cli, ["whoami", "--json"])
+        assert json.loads(result.output) == self.INFO
+
+    @patch("jrun.commands.misc.PlatformAPI")
+    def test_disabled_is_shown(self, mock_api_cls, runner):
+        mock_api_cls.return_value.whoami.return_value = {**self.INFO, "active": False}
+        assert "(disabled)" in runner.invoke(cli, ["whoami"]).output
+
+    @patch("jrun.commands.misc.PlatformAPI")
+    def test_error_is_clean(self, mock_api_cls, runner):
+        from jrun.errors import ApiError
+        mock_api_cls.return_value.whoami.side_effect = ApiError("u", 401, "bad token")
+        result = runner.invoke(cli, ["whoami"])
+        assert result.exit_code == 1
+        assert "bad token" in result.output and "Traceback" not in result.output

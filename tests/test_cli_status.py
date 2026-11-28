@@ -119,3 +119,96 @@ class TestStatus:
             "zoneName": "dx-calc1-zonea",
         }
         assert "platform-multi.baai.ac.cn" in result.output
+
+
+# --- remote jobs and --json ---------------------------------------------------------
+
+import pytest  # noqa: E402
+
+from tests.remote_fakes import URL, FakeRemote, registry  # noqa: E402
+
+
+@pytest.fixture
+def fake_remote():
+    fake = FakeRemote()
+    with patch("jrun.commands.status.RemoteRegistry", return_value=registry(fake)):
+        yield fake
+
+
+def _tracker(project_dir, jobs, searches=None):
+    (project_dir / ".jrun" / "jobs.json").write_text(
+        json.dumps({"searches": searches or {}, "jobs": jobs}))
+
+
+class TestRemoteStatus:
+    @patch("jrun.commands.status.PlatformClient")
+    def test_remote_jobs_refreshed_from_service_not_platform(
+            self, mock_platform_cls, runner, project_dir, monkeypatch, fake_remote):
+        monkeypatch.chdir(project_dir)
+        _tracker(project_dir, {"r-1": {"name": "pub", "search_name": None, "status": "Submitted",
+                                       "remote": URL, "submitted_at": "2026-11-27T00:00:00"}})
+        fake_remote.rows = [{"job_id": "r-1", "name": "pub", "status": "Running",
+                             "platform": PLATFORM_CONTEXT}]
+        client = MagicMock()
+        mock_platform_cls.return_value = client
+        result = runner.invoke(cli, ["job", "status"])
+        assert result.exit_code == 0, result.output
+        assert "Running" in result.output
+        client.get_job_info.assert_not_called()
+
+    @patch("jrun.commands.status.PlatformClient")
+    def test_unreachable_service_warns(self, mock_platform_cls, runner, project_dir,
+                                       monkeypatch, fake_remote):
+        from tests.remote_fakes import unreachable
+        monkeypatch.chdir(project_dir)
+        _tracker(project_dir, {"r-1": {"name": "pub", "status": "Running", "remote": URL,
+                                       "submitted_at": "x"}})
+        fake_remote.error = unreachable()
+        result = runner.invoke(cli, ["job", "status"])
+        assert result.exit_code == 0
+        assert f"Warning: remote service {URL}" in result.output
+
+
+class TestStatusJson:
+    @patch("jrun.commands.status.PlatformClient")
+    def test_json_lists_refreshed_jobs(self, mock_platform_cls, runner, project_dir,
+                                       monkeypatch, fake_remote):
+        monkeypatch.chdir(project_dir)
+        _tracker(project_dir, {
+            "loc": {"name": "a", "search_name": "s", "status": "Running", "params": {"x": 1},
+                    "submitted_at": "t"},
+            "queued-1": {"name": "b", "search_name": "s", "status": "Queued", "remote": URL,
+                         "submitted_at": "t"}},
+            {"s": {"job_ids": ["loc", "queued-1"], "config_file": "c.yaml",
+                   "submitted_at": "t"}})
+        fake_remote.rows = [{"job_id": "real-b", "name": "b", "search_name": "s",
+                             "status": "Pending"}]
+        client = MagicMock()
+        client.get_job_status.return_value = "Failed"
+        client.get_job_info.return_value = {"status": "Failed"}
+        mock_platform_cls.return_value = client
+
+        result = runner.invoke(cli, ["job", "status", "s", "--json"])
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        rows = {r["job_id"]: r for r in data["jobs"]}
+        assert rows["loc"]["status"] == "Failed"
+        assert rows["loc"]["params"] == {"x": 1}
+        # the remote queued job started on the service: re-keyed
+        assert rows["real-b"]["status"] == "Pending" and rows["real-b"]["remote"] == URL
+        assert data["searches"]["s"]["job_ids"] == ["loc", "real-b"]
+
+    @patch("jrun.commands.status.PlatformClient")
+    def test_json_status_filter_and_unknown_name(self, mock_platform_cls, runner, project_dir,
+                                                 monkeypatch, fake_remote):
+        monkeypatch.chdir(project_dir)
+        _tracker(project_dir, {"a": {"name": "a", "status": "Failed", "submitted_at": "t",
+                                     "platform": PLATFORM_CONTEXT},
+                               "b": {"name": "b", "status": "Stopped", "submitted_at": "t",
+                                     "platform": PLATFORM_CONTEXT}})
+        mock_platform_cls.return_value = MagicMock()
+        data = json.loads(runner.invoke(cli, ["job", "status", "-s", "Failed", "--json"]).stdout)
+        assert [r["job_id"] for r in data["jobs"]] == ["a"]
+        data = json.loads(runner.invoke(cli, ["job", "status", "nope", "--json"]).stdout)
+        assert data == {"jobs": [], "searches": {}}

@@ -357,6 +357,20 @@ class TestAutoPlacement:
         assert "auto-c: public A" in result.output and "waits for a public/idle slot" in result.output
         assert "JRUN_ACCELERATOR_COUNT" in result.output
 
+    def test_dry_run_avoids_fifo_pool_with_waiting_jobs(self, runner, project_dir, tmp_path,
+                                                        monkeypatch):
+        monkeypatch.chdir(project_dir)
+        api = _auto_api()
+        api.shared_waiting = {("QUEUE_CATEGORY_PUBLIC", "id-A"): 3}
+        with patch("jrun.commands.submit.PlatformAPI", return_value=api):
+            result = runner.invoke(cli, ["submit", _write(tmp_path, AUTO_SEARCH), "--dry-run"])
+        assert result.exit_code == 0, result.output
+        # Pool A shows 8 free cards but 3 jobs wait ahead: auto-a starts on V instead.
+        assert f"auto-a: public V (北京-大兴/可用区A) {V100} x8 - free cards, starts now" \
+            in result.output
+        assert (f"auto-b: public A (北京-大兴/可用区A) {A100} x8 - queued on the platform "
+                "(3 waiting ahead)") in result.output
+
     def test_dry_run_without_credentials_still_previews(self, runner, project_dir, tmp_path,
                                                         monkeypatch):
         monkeypatch.chdir(project_dir)
@@ -403,3 +417,189 @@ job:
         assert result.exit_code == 1
         assert "no public/idle submit slot" in result.output
         platform.modify_configs.assert_not_called()
+
+
+# --- remote routing, --only, --json ---------------------------------------------
+
+from tests.remote_fakes import URL, FakeRemote, registry  # noqa: E402
+
+REMOTE_GRID = f"""
+experiment:
+  name: test-exp
+  image: img:1
+  queue_name: jiuding_airs1_h100
+  project_set_name: baai-safety
+remote:
+  url: {URL}
+search:
+  name: mixed
+  job_template:
+    name: j_{{cat}}
+    command: echo $$HOME
+    resource_config:
+      queue_category: "{{cat}}"
+    run_options:
+      duration_hours: 1
+      usage_desc: test
+      queue_priority_mode: high
+  params:
+    - name: cat
+      values: [public, idle]
+"""
+
+
+@pytest.fixture
+def fake_remote():
+    fake = FakeRemote()
+    with patch("jrun.commands.submit.RemoteRegistry", return_value=registry(fake)):
+        yield fake
+
+
+class TestRemoteSubmit:
+    def test_dry_run_shows_routes_without_contacting_service(
+            self, runner, project_dir, tmp_path, monkeypatch, fake_remote):
+        monkeypatch.chdir(project_dir)
+        result = runner.invoke(cli, ["submit", _write(tmp_path, REMOTE_GRID), "--dry-run"])
+        assert result.exit_code == 0, result.output
+        assert f"Route: remote ({URL})" in result.output
+        assert "Route: local" in result.output
+        assert fake_remote.submits == []
+
+    def test_mixed_grid_splits_local_and_remote(self, runner, project_dir, tmp_path,
+                                                monkeypatch, platform, fake_remote):
+        monkeypatch.chdir(project_dir)
+        result = runner.invoke(cli, ["submit", _write(tmp_path, REMOTE_GRID)])
+        assert result.exit_code == 0, result.output
+        # the public job went to the service, the idle one ran locally
+        assert fake_remote.submits[0]["only"] == ["j_public"]
+        assert platform.run_config.call_count == 1
+        assert platform.run_config.call_args.args[1] == "j_idle"
+        installed = platform.modify_configs.call_args.args[0]
+        assert [j.name for j in installed] == ["j_idle"]
+        tracker = json.loads((project_dir / ".jrun" / "jobs.json").read_text())
+        assert tracker["jobs"]["r-j_public"]["remote"] == URL
+        assert "remote" not in tracker["jobs"]["uuid-1234-5678"]
+        assert sorted(tracker["searches"]["mixed"]["job_ids"]) == ["r-j_public",
+                                                                   "uuid-1234-5678"]
+
+    def test_sent_config_is_the_substituted_yaml(self, runner, project_dir, tmp_path,
+                                                 monkeypatch, platform, fake_remote):
+        monkeypatch.chdir(project_dir)
+        runner.invoke(cli, ["submit", _write(tmp_path, REMOTE_GRID), "--only", "j_public"])
+        sent = fake_remote.submits[0]["config"]
+        assert "remote" not in sent
+        # $$HOME arrives as a literal $HOME (the service must escape it again)
+        assert sent["search"]["job_template"]["command"] == "echo $HOME"
+
+    def test_only_limits_the_grid(self, runner, project_dir, tmp_path, monkeypatch,
+                                  platform, fake_remote):
+        monkeypatch.chdir(project_dir)
+        result = runner.invoke(cli, ["submit", _write(tmp_path, REMOTE_GRID),
+                                     "--only", "j_idle"])
+        assert result.exit_code == 0, result.output
+        assert fake_remote.submits == []
+        assert platform.run_config.call_count == 1
+
+    def test_only_unknown_name_is_clean_error(self, runner, project_dir, tmp_path, monkeypatch):
+        monkeypatch.chdir(project_dir)
+        result = runner.invoke(cli, ["submit", _write(tmp_path, REMOTE_GRID), "--only", "nope"])
+        assert result.exit_code == 1
+        assert "no job named nope" in result.output
+
+    def test_remote_job_without_project_set_fails_early(self, runner, project_dir, tmp_path,
+                                                        monkeypatch, platform, fake_remote):
+        monkeypatch.chdir(project_dir)
+        config = REMOTE_GRID.replace("  project_set_name: baai-safety\n", "")
+        result = runner.invoke(cli, ["submit", _write(tmp_path, config)])
+        assert result.exit_code == 1
+        assert "project_set_name" in result.output
+        assert fake_remote.submits == [] and platform.run_config.call_count == 0
+
+    def test_remote_failure_in_grid_keeps_local_jobs(self, runner, project_dir, tmp_path,
+                                                     monkeypatch, platform, fake_remote):
+        from tests.remote_fakes import unreachable
+        monkeypatch.chdir(project_dir)
+        fake_remote.error = unreachable()
+        result = runner.invoke(cli, ["submit", _write(tmp_path, REMOTE_GRID)])
+        assert "Remote submit failed" in result.output
+        assert platform.run_config.call_count == 1
+
+    def test_single_remote_job_overwrites_remote_job(self, runner, project_dir, tmp_path,
+                                                     monkeypatch, platform, fake_remote):
+        monkeypatch.chdir(project_dir)
+        _set_tracker(project_dir, {"r-old": {"name": "solo", "status": "Failed",
+                                             "remote": URL, "platform": {"userId": "u"}}})
+        config = (f"experiment:\n  name: e\n  image: i\n  queue_name: pool\n"
+                  f"  project_set_name: ps\n  queue_category: public\n"
+                  f"remote:\n  url: {URL}\n"
+                  "job:\n  name: solo\n  command: c\n  run_options:\n    duration_hours: 1\n"
+                  "    usage_desc: t\n    queue_priority_mode: high\n")
+        result = runner.invoke(cli, ["submit", _write(tmp_path, config), "-o"], input="y\n")
+        assert result.exit_code == 0, result.output
+        assert fake_remote.submits[0]["only"] == ["solo"]
+        jobs = json.loads((project_dir / ".jrun" / "jobs.json").read_text())["jobs"]
+        assert set(jobs) == {"r-solo"}
+        platform.run_config.assert_not_called()
+
+
+class TestSubmitJson:
+    def test_dry_run_json(self, runner, project_dir, tmp_path, monkeypatch, fake_remote):
+        monkeypatch.chdir(project_dir)
+        result = runner.invoke(cli, ["submit", _write(tmp_path, REMOTE_GRID), "--dry-run",
+                                     "--json"])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert data["dry_run"] is True
+        assert data["search_name"] == "mixed"
+        rows = {r["name"]: r for r in data["jobs"]}
+        assert rows["j_public"]["route"] == "remote"
+        assert rows["j_public"]["queue_category"] == "public"
+        assert rows["j_public"]["project_set_name"] == "baai-safety"
+        assert rows["j_idle"]["route"] == "local"
+        assert rows["j_idle"]["auto"] is False
+
+    def test_dry_run_json_marks_auto_jobs(self, runner, project_dir, tmp_path, monkeypatch):
+        monkeypatch.chdir(project_dir)
+        config = _write(tmp_path, EXP + "job:\n  name: a\n  command: c\n  resource_config:\n"
+                        "    queue_name: auto\n    accelerator_model: [H100, A100]\n"
+                        "    accelerator_count: [8, 4]\n")
+        with patch("jrun.commands.submit.PlatformAPI", side_effect=ApiError("u", 401)):
+            result = runner.invoke(cli, ["submit", config, "--dry-run", "--json"])
+        assert result.exit_code == 1  # no credentials for placement
+        with patch("jrun.commands.submit.place_jobs", return_value=(None, {})), \
+                patch("jrun.commands.submit.PlatformAPI"):
+            result = runner.invoke(cli, ["submit", config, "--dry-run", "--json"])
+        row = json.loads(result.stdout)["jobs"][0]
+        assert row["auto"] is True
+        assert row["accelerator_choices"] == [["H100", 8], ["A100", 4]]
+
+    def test_real_submit_json_lists_new_jobs_only(self, runner, project_dir, tmp_path,
+                                                  monkeypatch, platform):
+        monkeypatch.chdir(project_dir)
+        _set_tracker(project_dir, {"other": {"name": "unrelated", "status": "Running"}})
+        result = runner.invoke(cli, ["submit", _write(tmp_path, JOB_CONFIG), "--json", "-y"])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert [r["job_id"] for r in data["jobs"]] == ["uuid-1234-5678"]
+        assert data["jobs"][0]["status"] == "Submitted"
+        assert data["experiment"] == {"name": "test-exp", "id": "eid-123"}
+        assert data["not_submitted"] == [] and data["errors"] == []
+
+    def test_json_never_prompts(self, runner, project_dir, tmp_path, monkeypatch, platform):
+        monkeypatch.chdir(project_dir)
+        _set_tracker(project_dir, {"old": {"name": "test-job", "status": "Failed"}})
+        platform.get_job_status.return_value = "Failed"
+        # no -o: an existing job is skipped instead of prompting
+        result = runner.invoke(cli, ["submit", _write(tmp_path, JOB_CONFIG), "--json"])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert data["jobs"] == [] and data["not_submitted"] == ["test-job"]
+        platform.run_config.assert_not_called()
+
+    def test_json_without_yes_declines_experiment_creation(self, runner, project_dir, tmp_path,
+                                                           monkeypatch, platform):
+        monkeypatch.chdir(project_dir)
+        platform.find_experiment.return_value = None
+        result = runner.invoke(cli, ["submit", _write(tmp_path, JOB_CONFIG), "--json"])
+        assert result.exit_code == 1
+        assert "declined" in result.output

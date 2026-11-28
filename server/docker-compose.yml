@@ -1,0 +1,17 @@
+# jrun remote-submission service.
+#   cp /client-tools/airsctl ./airsctl     # from a jiuding pod
+#   cp .env.example .env && $EDITOR .env  # AIRS_AK / AIRS_SK / project sets
+#   docker compose up -d --build
+services:
+  jrun-server:
+    build:
+      context: .
+      args:
+        JRUN_REF: ${JRUN_REF:-main}
+    image: jrun-server:latest
+    env_file: .env
+    ports:
+      - "${JRUN_SERVE_PUBLISH:-8080}:8080"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

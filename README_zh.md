@@ -52,9 +52,10 @@ jrun 按三个层次组织工作：
 jrun init                       # 在当前目录创建 .jrun/
 jrun login                      # 将平台 AK/SK 存入 ~/.jrun/auth.json（交互式输入）
 jrun login --ak <AK> --sk <SK>  # 非交互方式
+jrun whoami                     # 查看账号、身份类型和已加入的项目集（支持 --json）
 ```
 
-`jrun init` 只创建 `.jrun/` 目录（其中的 `settings.json` 只是空的标记文件，不绑定任何实验），所有 `jrun` 命令会从当前目录向上查找该目录。`jrun login` 会用你的 AK/SK 换取 token 并验证；创建实验、解析队列和查询队列都需要 REST API 凭据。凭据解析顺序：`AIRS_AK`/`AIRS_SK` 环境变量 → `~/.jrun/auth.json` → `/etc/accesskey/{user-ak,user-sk}`（base64 编码，九鼎平台 pod 上自动挂载）→ airsctl 缓存的 token（`/tmp/.airs/.token`）。在平台 pod 上凭据会自动获取，无需登录。
+`jrun init` 只创建 `.jrun/` 目录（其中的 `settings.json` 只是空的标记文件，不绑定任何实验），所有 `jrun` 命令会从当前目录向上查找该目录。`jrun login` 会用你的 AK/SK 换取 token 并验证；创建实验、解析队列和查询队列都需要 REST API 凭据。凭据解析顺序：`AIRS_TOKEN`（现成 token）→ `AIRS_AK`/`AIRS_SK` 环境变量 → `~/.jrun/auth.json` → `/etc/accesskey/{user-ak,user-sk}`（base64 编码，九鼎平台 pod 上自动挂载）→ airsctl 缓存的 token（`/tmp/.airs/.token`）。在平台 pod 上凭据会自动获取，无需登录。
 
 ### 2. 编写配置文件
 
@@ -65,7 +66,17 @@ jrun template                    # 输出到终端
 jrun template -f config/my.yaml  # 写入文件
 ```
 
-所有要提交到平台的配置都必须有顶层 `experiment:` 块，且至少包含 `name:`。jrun 按名称精确查找实验，不存在则通过平台 API 创建（占位 config 使用第一个 job 的 image 和队列）。该块还可以为 job 提供默认值（`image`、`image_region`、`queue_name`、`queue_category`、`project_set_name`、`project_name`、`region_name`、`zone_name`），以及实验级设置（`description`、`train_frame`、`restart_policy`、`storage_info` 等）。job 级的值总是优先于实验默认值。缺少该块时 `--dry-run` 只给出警告，正式提交会失败。
+所有要提交到平台的配置都必须有顶层 `experiment:` 块，且至少包含 `name:`。jrun 按名称精确查找实验，不存在则通过平台 API 创建（占位 config 使用第一个 job 的 image 和队列）。该块还可以为 job 提供默认值（`image`、`image_region`、`queue_name`、`queue_category`、`project_set_name`、`project_name`、`region_name`、`zone_name`），以及实验级设置（`description`、`train_frame`、`restart_policy`、`mounts` 等）。job 级的值总是优先于实验默认值。缺少该块时 `--dry-run` 只给出警告，正式提交会失败。
+
+`mounts` 控制挂载到该实验所有任务中的存储：`home`（`/home/<用户>`）、`project`（`/share/project`）、`projset`（`/share/projset`），取值为 `rw`、`ro` 或 `false`（不挂载）。没写的目录按 `rw` 挂载；完全不写 `mounts` 时保持平台默认（三个目录都 `rw`）。该设置在创建实验时和每次提交时都会写入，因此修改 YAML 后之后的任务就会生效。旧的原始 `storage_info` 列表会被拒绝；如确需原始列表，可放到 `platform_overrides` 下。
+
+```yaml
+experiment:
+  name: my-exp
+  mounts:
+    project: false   # 不挂载 /share/project
+    projset: ro      # /share/projset 只读
+```
 
 **网格搜索**（`config/search.yaml`）：
 
@@ -257,9 +268,11 @@ run_options:                          # 允许 public 时必填
 
 提交时，jrun 读取每个候选队列的空卡数，以及项目集剩余的公共/闲时提交名额（项目集上限减去运行中和排队中的任务数，即 `jrun queues` 的 RUN/LIMIT 列），然后按顺序为本次要提交的任务分配队列：
 
-1. **立即开跑**：按类别优先级、组合优先级、空卡数从多到少排序，选第一个空卡足够（`accelerator_count` × 所有角色的 replicas 之和）且（public/idle）还有提交名额的候选。
-2. **在平台排队**：放不下的任务，如果类别中有 `dedicated`，就分到专属队列排队（专属队列允许排队提交）；否则分到仍有提交名额的公共/闲时队列排队。
+1. **立即开跑**：按类别优先级、组合优先级、空卡数从多到少排序，选第一个空卡足够（`accelerator_count` × 所有角色的 replicas 之和）、前面没有排队任务（见下文）且（public/idle）还有提交名额的候选。
+2. **在平台排队**：放不下的任务，如果类别中有 `dedicated`，就分到专属队列排队（专属队列允许排队提交）；否则分到仍有提交名额的公共/闲时队列排队。在这些队列中优先选前面排队任务最少的，其次选空卡最多的。
 3. **等待名额**：公共/闲时名额都用完时，任务 config 会写到首选队列上，由后台 scheduler 在名额释放后启动（无论是否设置 `parallel_trials`）。单个 `job:` 如果需要等待，则直接报错。
+
+**FIFO 队列。** 队列可能显示有空卡，但前面已经有任务在排队（例如排队任务需要的卡比空卡多）。先进先出调度下，排在它后面的任务都不会启动，因此 jrun 不会把这样的队列当作「立即开跑」。专属队列除调度策略为 Traverse 外都按 FIFO 处理（Smart 也按 FIFO）。共享资源池总是 FIFO：公共任务（high 优先级）排在等待中的公共任务之后，闲时任务（low 优先级）排在等待中的公共和闲时任务之后，按所有项目集统计。读取排队数失败时，退回只看空卡。`jrun queues` 的 WAITING 列显示这些数量，分配预览会打印 `N waiting ahead`。
 
 公共和闲时是同一批物理资源池，因此空卡只计算一次，提交名额按模式分别计算。卡型名需要精确匹配（不区分大小写）；总容量小于任务所需卡数的队列不会被选中。分配后的任务就是所选队列上的普通任务，并带有 `JRUN_QUEUE_NAME`、`JRUN_ACCELERATOR_MODEL`、`JRUN_ACCELERATOR_COUNT` 环境变量，命令可以据此调整（例如 `echo $$JRUN_ACCELERATOR_MODEL`）；直接运行 `torchrun`（不写 `--nproc_per_node`）就会按可见 GPU 数启动进程（见[远程任务环境变量](#远程任务环境变量)）。`--dry-run` 会用只读的平台查询预览分配结果；真正提交时会按当时的容量重新分配。`accelerator_model`/`accelerator_count`/`queue_category` 写成列表时必须使用 `queue_name: auto`（也可以写在 `experiment:` 块中），auto 任务的角色不能覆盖卡型和卡数字段。等待名额的任务，其队列在提交时就已确定。
 
@@ -282,6 +295,12 @@ jrun submit config/search.yaml --overwrite
 
 # 仅覆盖特定状态的任务
 jrun submit config/search.yaml -o -s Failed -s Stopped
+
+# 只提交网格中的部分任务（可重复）
+jrun submit config/search.yaml --only my_eval_lr0.01
+
+# 以 JSON 输出结果（不交互；提示信息输出到 stderr）
+jrun submit config/search.yaml --dry-run --json
 ```
 
 当任务名已存在于追踪记录中时，jrun 会提示覆盖或跳过。使用 `--overwrite`（`-o`）自动覆盖，可配合 `--status`（`-s`）按状态过滤。
@@ -301,6 +320,18 @@ YAML 并按照“新任务/覆盖/跳过”的决定筛选任务，然后只调�
 用途，否则请使用专用 experiment。设置 `parallel_trials` 时，首次 modify 会
 写入全部选中 config，后台 scheduler 只负责运行尚未启动的 config。如果实验已
 有 100 个及以上 config，jrun 会警告并询问是否继续。
+
+#### 通过远程服务提交公共队列任务
+
+如果你的账号只能提交专属队列和闲时队列、不能提交公共资源池，可以由 jrun 远程提交服务（见[远程提交服务](#远程提交服务)）代为提交公共任务。在配置中加顶层 `remote:` 块即可开启：
+
+```yaml
+remote:
+  url: https://jrun-svc.example.com   # 也可以写 $JRUN_REMOTE_URL
+  categories: [public]                # 默认：只有公共任务走远程
+```
+
+auto 选队列之后，最终类别在列表中的任务发往服务，其余任务照常在本地提交；`--dry-run` 会为每个任务显示 `Route:`。走远程的任务需要 `project_set_name`。服务会用你自己的凭据验证身份，检查你已加入该项目集，并且能以闲时视角看到目标资源池，然后用服务账号提交到实验 `<你的 alias>-<name>`（`mounts.home` 关闭）。这些任务在本地记录服务地址，`jrun job status / stop / remove` 会通过服务操作它们。示例见 `examples/remote-public.yaml`，详见 `docs/remote-service.md`。
 
 如果实验尚不存在，jrun 会询问是否创建（加 `-y` 跳过询问）。只想创建实验、不提交任务时：
 
@@ -329,7 +360,7 @@ jrun gpu-usage --cluster-id <ID> --zone-id <ID>   # 按集群 / 可用区过滤�
 jrun gpu-usage --owner my-workspace -n 20         # 按 owner 过滤，显示 20 行（默认 50）
 ```
 
-公共和闲时是同一批共享资源池的两种提交方式，因此 `jrun queues` 会把每个共享资源池在 `public` 和 `idle` 下各列一次，各自带有 RUN/LIMIT（运行中任务数 / 项目集上限）。`--proj-id` / `--projset-id`（`gpu-usage`、`experiment jobs`、`experiment delete` 也支持）用于设置项目 / 项目集请求头；默认不发送项目，项目集从账号已加入的项目集中自动确定。
+公共和闲时是同一批共享资源池的两种提交方式，因此 `jrun queues` 会把每个共享资源池在 `public` 和 `idle` 下各列一次，各自带有 RUN/LIMIT（运行中任务数 / 项目集上限）。WAITING 是新任务前面排队的任务数：专属队列为队列中 Pending/Scheduling 的任务（Traverse 队列显示 `-`，因为排队任务不会阻塞）；共享资源池为所有项目集的排队任务（public 只算公共任务，idle 算公共 + 闲时任务）。有空卡但 WAITING > 0 的队列不会立刻启动新任务。`--proj-id` / `--projset-id`（`gpu-usage`、`experiment jobs`、`experiment delete` 也支持）用于设置项目 / 项目集请求头；默认不发送项目，项目集从账号已加入的项目集中自动确定。
 
 ### 5. 查看状态
 
@@ -348,9 +379,14 @@ jrun job status <任务名或ID>
 # 仅显示特定状态的任务
 jrun job status -s Running
 jrun job status my_eval -s Failed -s Stopped
+
+# 以 JSON 输出刷新后的任务（全部匹配项）
+jrun job status my_eval --json
 ```
 
-状态输出包含彩色状态指示和可点击的平台链接（需平台 ID 可用）。
+状态输出包含彩色状态指示和可点击的平台链接（需平台 ID 可用）。通过远程服务提交的任务从该服务刷新状态（每个服务一次请求）。
+
+`jrun queues`、`jrun job stop`、`jrun job remove` 也支持 `--json`，JSON 结构见 `docs/remote-service.md`。
 
 ### 6. 管理任务
 
@@ -426,7 +462,8 @@ jrun experiment delete <实验名或ID>
 | `experiment.region_name` / `zone_name` / `queue_name` | experiment | 默认地域、可用区和队列名称 |
 | `experiment.queue_category` | experiment | 默认队列类型：`dedicated`、`public` 或 `idle`（`queue_name: auto` 时可写优先级列表） |
 | `experiment.description` | experiment | jrun 创建实验时使用的描述 |
-| `experiment.train_frame` / `restart_policy` / `storage_info` / `native_cluster` / `profiler_info` / `model_storage_info` | experiment | 提交时写入实验的实验级设置 |
+| `experiment.train_frame` / `restart_policy` / `native_cluster` / `profiler_info` / `model_storage_info` | experiment | 提交时写入实验的实验级设置 |
+| `experiment.mounts` | experiment | `{home, project, projset}`：`rw` / `ro` / `false`；挂载到任务中的存储（默认全部 `rw`） |
 | `name` | job / job_template | 任务名（支持 `{param}` 和 `{auto:Ns}`） |
 | `image` | job / job_template | 任务运行的 Docker 镜像（search 中支持 `{param}`）；覆盖 `experiment.image` |
 | `image_region` | job / job_template | 镜像仓库类型：`PUBLIC`（默认）或 `PRIVATE`，不区分大小写 |
@@ -439,7 +476,7 @@ jrun experiment delete <实验名或ID>
 | `selected_nodes` | job / job_template、resource_config | 将任务固定到指定节点 |
 | `platform_overrides` | experiment / job / resource_config / role | 新增平台字段的原始透传（传递未建模 job 字段的唯一方式） |
 | `resource_config` | job / job_template | 资源配置；覆盖实验默认值 |
-| `resource_config.queue_name` | resource_config | 提交队列（通过 API 解析；`local` 为本地执行；`auto` 按空卡自动选队列） |
+| `resource_config.queue_name` | resource_config | 提交队列（通过 API 解析；`local` 为本地执行；`auto` 按空卡和排队任务自动选队列） |
 | `resource_config.queue_category` | resource_config | `dedicated`（默认）、`public` 或 `idle`；`queue_name: auto` 时可写优先级列表 |
 | `resource_config.project_set_name` / `project_name` | resource_config | 用于解析队列的项目集和项目名称 |
 | `resource_config.region_name` / `zone_name` | resource_config | 用于解析队列的地域和可用区名称 |
@@ -465,6 +502,29 @@ jrun experiment delete <实验名或ID>
 | `search.max_trials` | search | 最大参数组合数（默认 9999） |
 | `search.parallel_trials` | search | 最大并发任务数；其余 config 由 scheduler 运行 |
 | `search.poll_interval` | search | scheduler 轮询间隔秒数（默认 30） |
+| `remote.url` | remote | jrun 远程提交服务地址；路由到这里的任务由服务提交 |
+| `remote.categories` | remote | 走远程服务的队列类别，按 auto 选队列后的结果判断（默认 `[public]`） |
+
+## 远程提交服务
+
+`server/` 是独立的 `jrun-server` 包，自带 Dockerfile 和 `docker-compose.yml`。它用某个账号的 AK/SK 运行（例如可以使用公共资源池的 key），为通过验证的九鼎用户提交任务：每个调用者有独立的工作区，服务在其中调用 `jrun` CLI（`--json`）。
+
+```bash
+cd server
+cp /client-tools/airsctl ./airsctl   # 从九鼎开发环境拷贝
+cp .env.example .env                 # AIRS_AK、AIRS_SK、JRUN_SERVE_PROJECT_SETS，可选 JRUN_SERVE_USERS
+docker compose up -d --build
+```
+
+鉴权检查：
+- **身份**：调用者的 token 必须属于可用账号（设置了 `JRUN_SERVE_USERS` 时还须在名单中）。
+- **项目集**：必须在白名单中，且调用者已加入。
+- **资源池**：调用者必须能以闲时视角看到目标资源池。
+- **配置**：按白名单重建（不允许平台原始字段、代码/数据集/模型存储字段和私有镜像），并重新转义 `$`，服务自身的环境变量不可能被替换进去。
+
+调用者会发送自己 2 小时有效的 token，请在服务前加 TLS。详见 `docs/remote-service.md`。
+
+jrun 本身也可以在九鼎 pod 之外运行：设置 `JRUN_AIRSCTL_GATEWAY=http://platform-multi.baai.ac.cn` 后，每次 airsctl 调用都会追加 `-u <gateway>`，以及任务所在队列的项目上下文（`-P/-p`），见 `docs/airsctl.md`。
 
 ## 目录结构
 

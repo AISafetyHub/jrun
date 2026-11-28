@@ -1,22 +1,17 @@
-import base64
-import hashlib
-import hmac
-import io
 import json
-import urllib.error
-import urllib.request
 
 import pytest
 
 from jrun.api import (
     PlatformAPI,
-    compute_signature,
     filter_queues,
     queue_location_info,
     save_auth,
+    shared_waiting_ahead,
     with_project_context,
 )
 from jrun.errors import ApiError
+from tests.http_fakes import FakeOpener, make_http_error
 
 
 # Sample row adapted from the queue/select API doc.
@@ -51,225 +46,11 @@ SAMPLE_QUEUE = {
 }
 
 
-class FakeResponse:
-    def __init__(self, payload):
-        self.payload = payload
-
-    def read(self):
-        return json.dumps(self.payload).encode()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
-
-
-class FakeOpener:
-    """Returns queued payloads (or raises queued exceptions) per open() call."""
-
-    def __init__(self, *responses):
-        self.responses = list(responses)
-        self.requests = []
-
-    def open(self, request, timeout=None):
-        self.requests.append(request)
-        response = self.responses.pop(0)
-        if isinstance(response, Exception):
-            raise response
-        if isinstance(response, FakeResponse):
-            return response
-        return FakeResponse(response)
-
-
-def make_http_error(code, payload):
-    return urllib.error.HTTPError(
-        url="https://x", code=code, msg="err", hdrs=None,
-        fp=io.BytesIO(json.dumps(payload).encode()),
-    )
-
-
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     monkeypatch.delenv("AIRS_AK", raising=False)
     monkeypatch.delenv("AIRS_SK", raising=False)
     monkeypatch.delenv("JRUN_API_BASE", raising=False)
-
-
-class TestSignature:
-    def test_matches_doc_algorithm(self):
-        ts = "20260514T055649Z"
-        sk = "sk-test"
-        # Independently recompute per the doc to pin the algorithm.
-        canonical = f"POST\n/api/v1/users/token/exchange\n{ts}"
-        canonical_hash = hashlib.sha256(canonical.encode()).hexdigest()
-        sts = f"AIRS-HMAC-SHA256\n{ts}\n{canonical_hash}"
-        expected = hmac.new(sk.encode(), sts.encode(), hashlib.sha256).hexdigest()
-        assert compute_signature(ts, sk) == expected
-
-
-class TestExchangeToken:
-    def test_constructs_signed_request(self):
-        opener = FakeOpener({"token": "tok-1"})
-        api = PlatformAPI(opener=opener)
-        result = api.exchange_token("ak-x", "sk-y")
-
-        assert result["token"] == "tok-1"
-        request = opener.requests[0]
-        assert request.get_method() == "POST"
-        assert request.full_url.endswith("/api/v1/users/token/exchange")
-        timestamp = request.headers["X-airs-date"]
-        auth = request.headers["Authorization"]
-        assert auth.startswith("AIRS-HMAC-SHA256 Credential=ak-x, Signature=")
-        signature = auth.split("Signature=")[1]
-        assert signature == compute_signature(timestamp, "sk-y")
-
-
-class TestAuthResolution:
-    def test_env_vars_take_precedence(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("AIRS_AK", "env-ak")
-        monkeypatch.setenv("AIRS_SK", "env-sk")
-        auth_file = tmp_path / "auth.json"
-        auth_file.write_text(json.dumps({"ak": "file-ak", "sk": "file-sk"}))
-        opener = FakeOpener({"token": "tok-env"}, {"data": {"alias": "yzh"}})
-        api = PlatformAPI(opener=opener, auth_file=auth_file,
-                          token_file=tmp_path / "missing")
-
-        api.get_userinfo()
-
-        exchange_req, userinfo_req = opener.requests
-        assert "Credential=env-ak" in exchange_req.headers["Authorization"]
-        assert userinfo_req.headers["Airs-token"] == "tok-env"
-
-    def test_auth_file_used_when_no_env(self, tmp_path):
-        auth_file = tmp_path / "auth.json"
-        auth_file.write_text(json.dumps({"ak": "file-ak", "sk": "file-sk"}))
-        opener = FakeOpener({"token": "tok-file"}, {"data": {}})
-        api = PlatformAPI(opener=opener, auth_file=auth_file,
-                          token_file=tmp_path / "missing")
-
-        api.get_userinfo()
-
-        assert "Credential=file-ak" in opener.requests[0].headers["Authorization"]
-
-    def test_airsctl_token_file_fallback(self, tmp_path):
-        token_file = tmp_path / ".token"
-        token_file.write_text("cached-token\n")
-        opener = FakeOpener({"data": {"alias": "yzh"}})
-        api = PlatformAPI(opener=opener, auth_file=tmp_path / "missing",
-                          accesskey_dir=tmp_path / "no-etc", token_file=token_file)
-
-        api.get_userinfo()
-
-        # No token exchange: the cached token is used directly.
-        assert len(opener.requests) == 1
-        assert opener.requests[0].headers["Airs-token"] == "cached-token"
-
-    def test_etc_accesskey_base64_decoded(self, tmp_path):
-        accesskey_dir = tmp_path / "accesskey"
-        accesskey_dir.mkdir()
-        (accesskey_dir / "user-ak").write_text(
-            base64.b64encode(b"ak-from-etc").decode() + "\n")
-        (accesskey_dir / "user-sk").write_text(
-            base64.b64encode(b"sk-from-etc").decode())
-        opener = FakeOpener({"token": "t"}, {"data": {}})
-        api = PlatformAPI(opener=opener, auth_file=tmp_path / "missing",
-                          accesskey_dir=accesskey_dir,
-                          token_file=tmp_path / "missing2")
-
-        api.get_userinfo()
-
-        auth = opener.requests[0].headers["Authorization"]
-        assert "Credential=ak-from-etc" in auth
-
-    def test_etc_accesskey_beats_token_file(self, tmp_path):
-        accesskey_dir = tmp_path / "accesskey"
-        accesskey_dir.mkdir()
-        (accesskey_dir / "user-ak").write_text(base64.b64encode(b"ak-etc").decode())
-        (accesskey_dir / "user-sk").write_text(base64.b64encode(b"sk-etc").decode())
-        token_file = tmp_path / ".token"
-        token_file.write_text("cached-token")
-        opener = FakeOpener({"token": "fresh-tok"}, {"data": {}})
-        api = PlatformAPI(opener=opener, auth_file=tmp_path / "missing",
-                          accesskey_dir=accesskey_dir, token_file=token_file)
-
-        api.get_userinfo()
-
-        # Exchange happened (etc/accesskey wins), stale cached token ignored.
-        assert len(opener.requests) == 2
-        assert opener.requests[1].headers["Airs-token"] == "fresh-tok"
-
-    def test_malformed_accesskey_falls_through(self, tmp_path):
-        accesskey_dir = tmp_path / "accesskey"
-        accesskey_dir.mkdir()
-        (accesskey_dir / "user-ak").write_text("not base64!!!")
-        (accesskey_dir / "user-sk").write_text("also not")
-        token_file = tmp_path / ".token"
-        token_file.write_text("cached-token")
-        opener = FakeOpener({"data": {}})
-        api = PlatformAPI(opener=opener, auth_file=tmp_path / "missing",
-                          accesskey_dir=accesskey_dir, token_file=token_file)
-
-        api.get_userinfo()
-
-        assert opener.requests[0].headers["Airs-token"] == "cached-token"
-
-    def test_no_credentials_raises(self, tmp_path):
-        api = PlatformAPI(opener=FakeOpener(), auth_file=tmp_path / "missing",
-                          accesskey_dir=tmp_path / "no-etc",
-                          token_file=tmp_path / "missing2")
-        with pytest.raises(ApiError, match="jrun login"):
-            api.get_userinfo()
-
-    def test_explicit_ak_sk_take_precedence(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("AIRS_AK", "env-ak")
-        monkeypatch.setenv("AIRS_SK", "env-sk")
-        opener = FakeOpener({"token": "tok-explicit"}, {"data": {}})
-        api = PlatformAPI(opener=opener, ak="cli-ak", sk="cli-sk",
-                          token_file=tmp_path / "missing")
-
-        api.get_userinfo()
-
-        assert "Credential=cli-ak" in opener.requests[0].headers["Authorization"]
-
-    def test_token_cached_per_instance(self, monkeypatch):
-        monkeypatch.setenv("AIRS_AK", "ak")
-        monkeypatch.setenv("AIRS_SK", "sk")
-        opener = FakeOpener({"token": "tok"}, {"data": {}}, {"data": {}})
-        api = PlatformAPI(opener=opener)
-
-        api.get_userinfo()
-        api.get_userinfo()
-
-        # One exchange + two userinfo calls.
-        assert len(opener.requests) == 3
-
-
-class TestProxyBypass:
-    def test_default_opener_ignores_env_proxies(self, monkeypatch):
-        monkeypatch.setenv("http_proxy", "http://proxy:8080")
-        api = PlatformAPI()
-        assert api._proxy_handler.proxies == {}
-
-
-class TestHttpErrors:
-    def test_http_error_raises_api_error_with_message(self):
-        error = make_http_error(401, {"code": "990002", "message": "invalid access key"})
-        api = PlatformAPI(opener=FakeOpener(error), ak="ak", sk="sk")
-        with pytest.raises(ApiError) as exc_info:
-            api.get_userinfo()
-        assert exc_info.value.status_code == 401
-        assert "invalid access key" in str(exc_info.value)
-
-    def test_invalid_json_raises_api_error(self):
-        class BadResponse(FakeResponse):
-            def read(self):
-                return b"not json"
-
-        opener = FakeOpener(BadResponse(None))
-        api = PlatformAPI(opener=opener, ak="ak", sk="sk")
-        with pytest.raises(ApiError, match="invalid JSON"):
-            api.get_userinfo()
 
 
 class TestQueues:
@@ -472,7 +253,12 @@ class TestCreateExperiment:
         # creatorId is a required int64 proto field, resolved from userinfo
         assert body["creatorId"] == "319832320808853520"
         assert body["creator"] == "Test User"
-        assert len(body["storageInfo"]) == 3
+        # No mounts configured: the platform's three default directories, rw.
+        assert body["storageInfo"] == [
+            {"directoryType": 5, "accessMode": 1},
+            {"directoryType": 4, "accessMode": 1},
+            {"directoryType": 2, "accessMode": 1},
+        ]
 
         configs = body["advanceConfigInfos"]
         assert len(configs) == 1
@@ -526,6 +312,19 @@ class TestCreateExperiment:
         body = json.loads(opener.requests[2].data.decode())
         resource = body["advanceConfigInfos"][0]["resourceConfigList"][0]
         assert resource["imageRegion"] == "PRIVATE"
+
+
+    @pytest.mark.parametrize("mounts, expected", [
+        ({"project": False, "projset": "ro"},
+         [{"directoryType": 5, "accessMode": 1}, {"directoryType": 2, "accessMode": 0}]),
+        # All unmounted must send an empty list, not fall back to the defaults.
+        ({"home": False, "project": False, "projset": False}, []),
+    ])
+    def test_mounts_become_storage_info(self, mounts, expected):
+        opener = FakeOpener({"token": "t"}, self.USERINFO, {"experimentId": "eid"})
+        api = PlatformAPI(opener=opener, ak="ak", sk="sk")
+        api.create_experiment(name="e", queue=SAMPLE_QUEUE, image="img", mounts=mounts)
+        assert json.loads(opener.requests[2].data.decode())["storageInfo"] == expected
 
 
 class TestJobSnapshots:
@@ -799,6 +598,51 @@ class TestSharedQueueEndpoints:
         assert opener.requests[0].full_url.endswith("/api/v1/shared-queue/list")
 
 
+class TestWaitingCounts:
+    def test_queue_waiting_count_body_and_total(self):
+        api, opener = _authed({"paging": {"page": 1, "pageSize": 1, "total": 4},
+                               "jobInfos": [{"id": "j"}]})
+        assert api.queue_waiting_count("q-1", proj_id="p", projset_id="ps") == 4
+        request = opener.requests[0]
+        assert request.full_url.endswith("/api/v1/job/select")
+        body = _body(request)
+        assert body["queueId"] == "q-1"
+        assert body["job_state"] == [0, 6]  # Pending, Scheduling
+        assert body["experimentType"] == 1
+        assert body["paging"]["pageSize"] == 1
+        assert request.headers["Airs-projset-id"] == "ps"
+
+    def test_queue_waiting_count_without_paging_counts_rows(self):
+        api, _ = _authed({"jobInfos": [{"id": "a"}, {"id": "b"}]})
+        assert api.queue_waiting_count("q-1", projset_id="ps") == 2
+
+    def test_shared_waiting_counts_all_projsets(self):
+        api, opener = _authed(
+            {"items": [{"queue": {"queueId": "a100"}, "jobCount": 15, "queueingCount": 7,
+                        "approvingCount": 0, "runningCount": 8},
+                       {"queue": {"queueId": "h100"}, "jobCount": 10, "queueingCount": 2,
+                        "approvingCount": 4, "runningCount": 3}]},
+            # Idle: queueingCount misses jobs in Scheduling (measured).
+            {"items": [{"queue": {"id": "a100"}, "jobCount": 12, "queueingCount": 0,
+                        "runningCount": 3}]},
+        )
+        counts = api.shared_waiting_counts(projset_id="ps")
+        assert counts == {("QUEUE_CATEGORY_PUBLIC", "a100"): 7,
+                          ("QUEUE_CATEGORY_PUBLIC", "h100"): 3,
+                          ("QUEUE_CATEGORY_IDLE", "a100"): 9}
+        for request, category in zip(opener.requests, ("PUBLIC", "IDLE")):
+            body = _body(request)
+            assert body["allProjsets"] is True
+            assert body["queueCategory"] == "QUEUE_CATEGORY_" + category
+
+    def test_shared_waiting_ahead_is_priority_aware(self):
+        counts = {("QUEUE_CATEGORY_PUBLIC", "q"): 2, ("QUEUE_CATEGORY_IDLE", "q"): 5}
+        assert shared_waiting_ahead(counts, "public", "q") == 2
+        assert shared_waiting_ahead(counts, "QUEUE_CATEGORY_IDLE", "q") == 7
+        assert shared_waiting_ahead(counts, "public", "other") == 0
+        assert shared_waiting_ahead(None, "public", "q") is None
+
+
 class TestResolveProjectContext:
     def test_no_names(self):
         api, opener = _authed()
@@ -872,3 +716,26 @@ class TestPlacementHelpers:
         queue = with_project_context({"projId": "own"}, "p1", "ps1", "proj", "set")
         assert queue == {"projId": "own", "projsetId": "ps1", "projName": "proj",
                          "projsetName": "set"}
+
+
+class TestWhoami:
+    def test_normalized_identity_and_projsets(self):
+        opener = FakeOpener(
+            {"data": {"id": 42, "alias": "intern1", "realName": "R", "identityType": "院外",
+                      "disabledTime": "0"}},
+            {"items": [{"projsetInfo": {"id": "ps-1", "name": "baai-safety", "x": 1}}]})
+        info = PlatformAPI(opener=opener, token="tok").whoami()
+        assert info == {"id": "42", "alias": "intern1", "real_name": "R",
+                        "identity_type": "院外", "active": True,
+                        "projsets": [{"id": "ps-1", "name": "baai-safety"}]}
+        # the given token is used as-is (no exchange)
+        assert opener.requests[0].headers["Airs-token"] == "tok"
+
+    def test_disabled_account(self):
+        opener = FakeOpener({"data": {"id": "1", "disabledTime": "1764000000"}}, {"items": []})
+        assert PlatformAPI(opener=opener, token="t").whoami()["active"] is False
+
+    def test_missing_id(self):
+        opener = FakeOpener({"data": {}})
+        with pytest.raises(ApiError, match="no user id"):
+            PlatformAPI(opener=opener, token="t").whoami()

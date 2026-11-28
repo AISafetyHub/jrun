@@ -16,7 +16,11 @@ path, experiment, or resource allocation.
   experiment by exact name or creates it. The block may also hold job defaults
   (`image`, `image_region`, `project_set_name`, `project_name`, `region_name`,
   `zone_name`, `queue_name`, `queue_category`) and experiment-level settings
-  (`description`, `train_frame`, `restart_policy`, `storage_info`, ...).
+  (`description`, `train_frame`, `restart_policy`, `mounts`, ...).
+- `experiment.mounts` picks the storage mounted into jobs: `home`
+  (`/home/<user>`), `project` (`/share/project`), `projset` (`/share/projset`),
+  each `rw`, `ro`, or `false`; omitted directories stay `rw`. The raw
+  `storage_info` list is rejected (use `platform_overrides` for raw fields).
   Job-level values always override these defaults.
 - `experiment_id`/`experiment_name` under `job:` or `search:`, the
   `submission:` alias, and `resource_config.worker` are removed and rejected.
@@ -257,14 +261,23 @@ Placement rules (computed at submit time for the jobs being submitted):
 
 1. A job **starts now** on the first candidate, ordered by category preference,
    then pair preference, then most free cards, that has enough free cards
-   (`accelerator_count` x total role replicas) and, for public/idle, a remaining
-   per-project-set submit slot (limit minus running and queueing jobs).
+   (`accelerator_count` x total role replicas), no jobs waiting ahead of it,
+   and, for public/idle, a remaining per-project-set submit slot (limit minus
+   running and queueing jobs).
 2. A job that fits nowhere is **queued on the platform**: on a dedicated queue
    if `dedicated` is listed, otherwise on a public/idle queue that still has a
-   submit slot.
+   submit slot; the queue with the fewest jobs waiting ahead wins.
 3. With no public/idle slot left the job **waits**: its config is installed on
    the preferred queue and the background scheduler starts it once a slot
    frees up. A single `job:` that would wait is refused with an error.
+
+Jobs waiting ahead: under FIFO scheduling nothing starts behind a waiting job,
+so a queue with free cards and waiting jobs cannot start a new one. Dedicated
+queues count as FIFO unless their schedule strategy is Traverse (Smart counts
+as FIFO); shared pools are FIFO, where public jobs wait behind waiting public
+jobs and idle jobs behind waiting public + idle jobs (all project sets). An
+unreadable count falls back to free cards only. See the WAITING column of
+`jrun queues`; the placement preview prints `N waiting ahead`.
 
 Public and idle list the same physical pools: free cards are counted once,
 submit slots per mode. Model names match exactly (case-insensitive). Location
@@ -282,6 +295,57 @@ job):
 | `JRUN_ACCELERATOR_COUNT` | Chosen accelerator count per replica. |
 
 Reference them as `$$JRUN_...` in commands so the remote shell expands them.
+
+## Remote submission (public pool through a service)
+
+For accounts without public-pool permission: a jrun remote-submission service
+submits the jobs that land on public; everything else is submitted locally.
+
+```yaml
+experiment:
+  name: my_eval
+  project_set_name: baai-safety      # required for jobs that go remote
+  project_name: baai-safety_research
+
+remote:
+  url: $JRUN_REMOTE_URL              # the service URL (ask the user)
+  categories: [public]               # default
+
+search:
+  name: my_eval
+  job_template:
+    name: my_eval_{data}
+    image: harbor.baai.ac.cn/library/pytorch:23.08
+    command: python eval.py --data {data}
+    resource_config:
+      queue_name: auto
+      queue_category: [public, idle]  # public goes remote, idle stays local
+      accelerator_model: NVIDIA_V100-PCIE-32GB
+      accelerator_count: 1
+    run_options:
+      duration_hours: 12
+      queue_priority_mode: normal
+      usage_desc: evaluation
+  params:
+    - name: data
+      values: [arc, gsm8k]
+```
+
+Rules:
+
+- **Routing:** decided per job after auto placement (`Route:` in dry-run). The
+  config sent to the service is the variable-substituted YAML without
+  `remote:`, plus the selected job names.
+- **What the service checks** (with the user's own token): the account is
+  active, the project set is served and joined, and the target pool is
+  visible as idle. For auto jobs, every public pool offering the model must be
+  visible.
+- **Allowed config:** no `platform_overrides`, `code`/`git_*`/`gitee`,
+  `dataset`, `model_storage_*`, unknown resource keys, or private images.
+- **What the service rewrites:** the experiment becomes `<alias>-<name>` and
+  `mounts.home: false` is forced.
+- **Tracking:** jobs are tracked locally with `remote: <url>`, and status,
+  stop and remove go through the service.
 
 ## Local debug job
 
@@ -306,7 +370,8 @@ unambiguous local smoke test.
 |---|---|---|
 | `name` | `experiment` | Experiment name (required; the block is required for a real submit). |
 | `image` / `image_region` | experiment | Default image and repo type for jobs that omit their own. |
-| `description` / `train_frame` / `restart_policy` / `storage_info` | experiment | Experiment-level settings (description is used on creation). |
+| `description` / `train_frame` / `restart_policy` | experiment | Experiment-level settings (description is used on creation). |
+| `mounts` | experiment | `{home, project, projset}`: `rw` / `ro` / `false`; storage mounted into jobs (default all `rw`). |
 | `project_set_name` / `project_name` | experiment / resource | Project path used to resolve queue names. |
 | `region_name` / `zone_name` | experiment / resource | Region and availability-zone names used to resolve queue names. |
 | `queue_name` / `queue_category` | experiment / resource | Queue name and type (`dedicated`, `public`, or `idle`); `queue_name: auto` allows a category list. |
@@ -319,7 +384,7 @@ unambiguous local smoke test.
 | `code` / `code_path` / `git_prefix` / `git_branch` / `git_commit` / `gitee` | workload | Code source fields. |
 | `dataset` / `model_storage_info` / `model_storage_info_items` | workload | Dataset and model-storage mounts. |
 | `selected_nodes` | workload / resource | Pin the job to specific nodes. |
-| `queue_name` | `resource_config` | Submission queue, resolved via the platform API; `local` executes on the current machine; `auto` picks a queue from free cards. |
+| `queue_name` | `resource_config` | Submission queue, resolved via the platform API; `local` executes on the current machine; `auto` picks a queue from free cards and waiting jobs. |
 | `queue_category` | `resource_config` | `dedicated` (default), `public`, or `idle`; public/idle use shared queues. With `queue_name: auto`, a preference-ordered list. |
 | `project_set_name` / `project_name` | resource / experiment | Project path used to resolve the queue. |
 | `region_name` / `zone_name` | resource / experiment | Region and availability-zone names used to resolve the queue. |
@@ -341,6 +406,8 @@ unambiguous local smoke test.
 | `platform_overrides` | experiment / job / resource / role | Raw passthrough for newer platform fields; the only way to pass unmodelled job fields. |
 | `name` / `params` / `sampling` / `max_trials` | `search` | Search name, `{name, values}` grid, `grid`, and the combination cap (default 9999). |
 | `parallel_trials` / `poll_interval` | `search` | Concurrency limit and scheduler poll interval in seconds (default 30). |
+| `remote.url` | top-level `remote:` | jrun remote-submission service URL |
+| `remote.categories` | top-level `remote:` | Categories routed to the service after placement (default `[public]`) |
 
 ## Variable reference
 

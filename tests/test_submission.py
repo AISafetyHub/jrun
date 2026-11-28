@@ -32,8 +32,10 @@ def project(tmp_path, monkeypatch):
     return Project.init()
 
 
-def _platform(job_ids=None):
+def _platform(job_ids=None, off_platform=False):
     platform = MagicMock()
+    platform.off_platform = off_platform
+    platform.context = ("p-1", "ps-1")
     platform.run_config.side_effect = list(job_ids or ["new-id"])
     return platform
 
@@ -145,6 +147,18 @@ class TestEnsureExperiment:
         assert kwargs["image_region"] == "PRIVATE"
         assert kwargs["queue_category"] == "QUEUE_CATEGORY_IDLE"
         assert (kwargs["proj_id"], kwargs["projset_id"]) == ("p1", "ps1")
+        assert kwargs["mounts"] is None  # platform default directories
+
+    def test_create_passes_mounts(self):
+        platform = MagicMock()
+        platform.find_experiment.return_value = None
+        api = MagicMock()
+        api.find_queue.return_value = QUEUE
+        spec = ExperimentSpec.from_dict({"name": "m", "image": "img", "queue_name": "q1",
+                                         "mounts": {"project": False}})
+        ensure_experiment(spec, platform, api, job_target(Job(name="j"), spec),
+                          assume_yes=True, confirm=None)
+        assert api.create_experiment.call_args.kwargs["mounts"] == {"project": False}
 
     def test_no_image_or_queue_raises(self):
         platform = MagicMock()
@@ -199,6 +213,45 @@ class TestResolveExperiment:
         with pytest.raises(ConfigError, match="jrun login"):
             resolve_experiment(MagicMock(), None, SPEC, [Job(name="j")],
                                dry_run=False, confirm=None)
+
+    def test_off_platform_sets_airsctl_context_before_lookup(self):
+        platform = MagicMock()
+        platform.off_platform = True
+        order = []
+        platform.set_context.side_effect = lambda *a: order.append(("context", a))
+        platform.find_experiment.side_effect = lambda name: order.append(("find", name)) or {
+            "experiment_id": "eid"}
+        api = MagicMock()
+        api.find_queue.return_value = QUEUE
+
+        resolve_experiment(platform, api, SPEC, [Job(name="j")], dry_run=False,
+                           confirm=None, echo=lambda m: None)
+
+        # experiment lookups are project-scoped: context from the queue first
+        assert order == [("context", ("p1", "ps1")), ("find", "spec-exp")]
+
+    def test_on_pod_context_untouched(self):
+        platform = MagicMock()
+        platform.off_platform = False
+        platform.find_experiment.return_value = {"experiment_id": "eid"}
+        api = MagicMock()
+        api.find_queue.return_value = QUEUE
+        resolve_experiment(platform, api, SPEC, [Job(name="j")], dry_run=False,
+                           confirm=None, echo=lambda m: None)
+        platform.set_context.assert_not_called()
+
+    def test_precomputed_placement_is_not_redone(self):
+        platform = MagicMock()
+        platform.find_experiment.return_value = {"experiment_id": "eid"}
+        api = MagicMock()
+        api.find_queue.return_value = QUEUE
+        placement = Placement()
+        with patch("jrun.submission.place_auto_jobs") as place:
+            resolved = resolve_experiment(platform, api, SPEC, [Job(name="j")],
+                                          dry_run=False, confirm=None, echo=lambda m: None,
+                                          placed=(placement, {}))
+        place.assert_not_called()
+        assert resolved.placement is placement
 
     def test_reads_experiment_once_and_resolves_queues(self):
         platform = MagicMock()
@@ -414,6 +467,17 @@ class TestSubmitJobs:
                 job.resource_config.project_name) == ("ps", "p")
         assert platform.run_config.call_args.kwargs["queue_category"] == "QUEUE_CATEGORY_IDLE"
 
+    def test_off_platform_scheduler_gets_airsctl_context(self, project):
+        platform = _platform(["id-a"], off_platform=True)
+        jobs = [Job(name="a"), Job(name="b")]
+        with patch("jrun.submission.Scheduler") as scheduler_cls:
+            scheduler_cls.return_value.start.return_value = 1
+            self._submit(project, platform, jobs,
+                         sched={"parallel_trials": 1, "poll_interval": 5})
+
+        # The daemon builds its own PlatformClient: it must get the context.
+        assert scheduler_cls.call_args.kwargs["airsctl_context"] == ("p-1", "ps-1")
+
     def test_parallel_trials_queues_rest_and_starts_scheduler(self, project):
         platform = _platform(["id-a"])
         jobs = [Job(name="a"), Job(name="b"), Job(name="c")]
@@ -426,7 +490,8 @@ class TestSubmitJobs:
         assert len(platform.modify_configs.call_args.args[0]) == 3
         assert platform.run_config.call_count == 1
         assert (result.pending, result.scheduler_pid) == (2, 4242)
-        scheduler_cls.assert_called_once_with(project.jrun_dir, "search", None, "eid", 1, 5)
+        scheduler_cls.assert_called_once_with(project.jrun_dir, "search", None, "eid", 1, 5,
+                                              airsctl_context=None)
         pending = scheduler_cls.return_value.start.call_args.args[0]
         assert [p["name"] for p in pending] == ["b", "c"]
         tracker = project.load_tracker()
@@ -510,7 +575,8 @@ class TestAutoPlacementFlow:
         assert [c.args[1] for c in platform.run_config.call_args_list] == ["a"]
         assert result.pending == 1
         # parallel_trials unset -> scheduler gets 0 (no concurrency limit)
-        scheduler_cls.assert_called_once_with(project.jrun_dir, "s", None, "eid", 0, 30)
+        scheduler_cls.assert_called_once_with(project.jrun_dir, "s", None, "eid", 0, 30,
+                                              airsctl_context=None)
         assert [p["name"] for p in scheduler_cls.return_value.start.call_args.args[0]] == ["b"]
         assert any("wait for a public/idle submit slot" in m for m in messages)
 
@@ -531,3 +597,164 @@ class TestAutoPlacementFlow:
                           overwrite=False, status_filter=None, confirm=None, choose=None,
                           echo=lambda m: None)
         platform.modify_configs.assert_not_called()
+
+
+# --- placement + remote routing ---------------------------------------------------
+
+from jrun.models import RemoteSpec  # noqa: E402
+from jrun.submission import decide_single, place_jobs, split_remote, submit_remote  # noqa: E402
+from tests.remote_fakes import URL, FakeRemote, registry, unreachable  # noqa: E402
+
+REMOTE = RemoteSpec.from_dict({"url": URL})
+PUBLIC_SPEC = ExperimentSpec(name="e", queue_name="pool", project_set_name="ps")
+
+
+def _job(name, category, **rc):
+    return Job(name=name, run_options=PUBLIC_OPTIONS,
+               resource_config=ResourceConfig(queue_category=category, **rc))
+
+
+class TestPlaceJobs:
+    def test_no_auto_jobs_no_api_calls(self):
+        api = MagicMock()
+        assert place_jobs(api, [Job(name="j")], SPEC, dry_run=False) == (None, {})
+        assert api.mock_calls == []
+
+    def test_dry_run_api_failure_warns(self):
+        auto = Job(name="a", resource_config=ResourceConfig(
+            queue_name="auto", accelerator_model="H100", accelerator_count=1))
+        messages = []
+        with patch("jrun.submission.place_auto_jobs", side_effect=ApiError("u", 500)):
+            assert place_jobs(MagicMock(), [auto], SPEC, dry_run=True,
+                              echo=messages.append) == (None, {})
+        assert "cannot read queue capacity" in messages[0]
+
+    def test_real_api_failure_raises(self):
+        auto = Job(name="a", resource_config=ResourceConfig(
+            queue_name="auto", accelerator_model="H100", accelerator_count=1))
+        with patch("jrun.submission.place_auto_jobs", side_effect=ApiError("u", 500)):
+            with pytest.raises(ApiError):
+                place_jobs(MagicMock(), [auto], SPEC, dry_run=False)
+
+
+class TestSplitRemote:
+    def test_without_remote_everything_is_local(self):
+        jobs = [_job("a", "public")]
+        assert split_remote(jobs, PUBLIC_SPEC, None) == (jobs, [])
+
+    def test_public_remote_rest_local(self):
+        a, b, c = _job("a", "public"), _job("b", "idle"), _job("c", None)
+        local, remote = split_remote([a, b, c], PUBLIC_SPEC, REMOTE)
+        assert [j.name for j in local] == ["b", "c"]
+        assert [j.name for j in remote] == ["a"]
+
+    def test_placed_auto_job_routes_by_placed_category(self):
+        # placement rewrote the auto job into a concrete public job
+        placed = _job("a", "public", queue_name="Public-Pool")
+        assert split_remote([placed], PUBLIC_SPEC, REMOTE)[1] == [placed]
+
+    def test_remote_job_needs_project_set(self):
+        with pytest.raises(ConfigError, match="project_set_name"):
+            split_remote([_job("a", "public")], ExperimentSpec(name="e", queue_name="q"),
+                         REMOTE)
+
+
+class TestSubmitRemote:
+    CONFIG = {"experiment": {"name": "e"}, "remote": {"url": URL}, "job": {"name": "a"}}
+
+    def test_submits_named_jobs_and_tracks_them(self, project):
+        fake = FakeRemote()
+        result = submit_remote(project, MagicMock(), URL, self.CONFIG, "s", "c.yaml",
+                               [_job("a", "public"), _job("b", "public")],
+                               remotes=registry(fake), echo=lambda m: None)
+        assert fake.submits[0]["only"] == ["a", "b"]
+        assert fake.submits[0]["overwrite"] is True
+        assert "remote" not in fake.submits[0]["config"]  # never forwarded
+        assert [e["job_id"] for e in result.job_entries] == ["r-a", "r-b"]
+        tracker = project.load_tracker()
+        assert tracker["jobs"]["r-a"]["remote"] == URL
+        assert tracker["jobs"]["r-a"]["experiment_name"] == "u-exp"
+        assert tracker["searches"]["s"]["job_ids"] == ["r-a", "r-b"]
+
+    def test_old_local_run_stopped_first_and_mapping_dropped(self, project):
+        project.record_search("s", "c.yaml", [{"job_id": "old", "name": "a"}])
+        project.update_job_status("old", "Running")
+        platform = MagicMock()
+        fake = FakeRemote()
+        submit_remote(project, platform, URL, self.CONFIG, "s", "c.yaml", [_job("a", "public")],
+                      replacements={"a": "old"}, remotes=registry(fake), echo=lambda m: None)
+        platform.job_stop.assert_called_once_with("old")
+        jobs = project.load_tracker()["jobs"]
+        assert "old" not in jobs and "r-a" in jobs
+
+    def test_old_local_run_that_cannot_stop_is_skipped(self, project):
+        project.record_search("s", "c.yaml", [{"job_id": "old", "name": "a"}])
+        project.update_job_status("old", "Running")
+        platform = MagicMock()
+        platform.job_stop.side_effect = PlatformError("job stop", 1, "busy")
+        platform.get_job_status.return_value = "Running"
+        fake = FakeRemote()
+        errors = []
+        result = submit_remote(project, platform, URL, self.CONFIG, "s", "c.yaml",
+                               [_job("a", "public")], replacements={"a": "old"},
+                               remotes=registry(fake), echo=lambda m: None,
+                               err_echo=errors.append)
+        assert fake.submits == [] and result.job_entries == []
+        assert "could not stop old job" in errors[0]
+
+    def test_old_remote_run_is_left_to_the_service(self, project):
+        project.record_remote_jobs("s", "c.yaml", [{"job_id": "r-old", "name": "a"}], URL)
+        fake = FakeRemote()
+        submit_remote(project, MagicMock(), URL, self.CONFIG, "s", "c.yaml",
+                      [_job("a", "public")], replacements={"a": "r-old"},
+                      remotes=registry(fake), echo=lambda m: None)
+        assert fake.stopped == []  # the service's --overwrite replaces it
+        jobs = project.load_tracker()["jobs"]
+        assert "r-old" not in jobs and "r-a" in jobs
+
+    def test_service_errors_reported_and_old_mapping_kept(self, project):
+        project.record_remote_jobs("s", "c.yaml", [{"job_id": "r-old", "name": "a"}], URL)
+        fake = FakeRemote()
+        fake.submit_result = {"jobs": [], "errors": ["a: run failed"]}
+        errors = []
+        submit_remote(project, MagicMock(), URL, self.CONFIG, "s", "c.yaml",
+                      [_job("a", "public")], replacements={"a": "r-old"},
+                      remotes=registry(fake), echo=lambda m: None, err_echo=errors.append)
+        assert errors == ["  remote: a: run failed"]
+        assert "r-old" in project.load_tracker()["jobs"]
+
+    def test_queued_rows_counted_as_pending(self, project):
+        fake = FakeRemote()
+        fake.submit_result = {"jobs": [{"job_id": "queued-x", "name": "a", "status": "Queued"}]}
+        result = submit_remote(project, MagicMock(), URL, self.CONFIG, "s", "c.yaml",
+                               [_job("a", "public")], remotes=registry(fake),
+                               echo=lambda m: None)
+        assert result.pending == 1
+
+    def test_unreachable_service_raises(self, project):
+        fake = FakeRemote()
+        fake.error = unreachable()
+        with pytest.raises(ApiError):
+            submit_remote(project, MagicMock(), URL, self.CONFIG, None, "c.yaml",
+                          [_job("a", "public")], remotes=registry(fake), echo=lambda m: None)
+
+
+class TestDecideSingle:
+    def test_remote_old_job_not_refreshed_locally(self, project):
+        project.record_remote_jobs(None, "c.yaml",
+                                   [{"job_id": "r-1", "name": "a", "status": "Running"}], URL)
+        platform = MagicMock()
+        proceed, existing = decide_single(project, platform, Job(name="a"), overwrite=True,
+                                          status_filter=None, confirm=lambda *a, **k: True,
+                                          choose=None, echo=lambda m: None)
+        assert proceed and existing[0] == "r-1"
+        platform.get_job_status.assert_not_called()
+
+    def test_skip_when_not_chosen(self, project):
+        project.record_single_job("old", "a")
+        platform = MagicMock()
+        platform.get_job_status.return_value = "Running"
+        proceed, _ = decide_single(project, platform, Job(name="a"), overwrite=False,
+                                   status_filter=None, confirm=None,
+                                   choose=lambda *a: False, echo=lambda m: None)
+        assert not proceed

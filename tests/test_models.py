@@ -1,6 +1,7 @@
 import pytest
 
-from jrun.models import (ACTIVE_STATUSES, STOPPABLE_STATUSES, TERMINAL_STATUSES,
+from jrun.models import (mount_entries, mount_entries_rest, normalize_mounts,
+                         ACTIVE_STATUSES, STOPPABLE_STATUSES, TERMINAL_STATUSES,
                          ExperimentSpec, Job, JobTarget, ResourceConfig,
                          RoleConfig, RunOptions, job_target,
                          normalize_image_region, normalize_queue_categories,
@@ -209,6 +210,35 @@ class TestExperimentSpec:
         with pytest.raises(ValueError, match="unknown image_region"):
             ExperimentSpec.from_dict({"name": "e", "image_region": "INTERNAL"})
 
+    def test_storage_info_rejected_for_mounts(self):
+        with pytest.raises(ValueError, match="storage_info: use mounts"):
+            ExperimentSpec.from_dict({"name": "e", "storage_info": []})
+
+    def test_mounts_normalized(self):
+        spec = ExperimentSpec.from_dict({"name": "e", "mounts": {
+            "home": "RW", "project": False, "projset": "ro"}})
+        assert spec.mounts == {"home": "rw", "project": False, "projset": "ro"}
+        assert ExperimentSpec.from_dict({"name": "e"}).mounts is None
+        assert normalize_mounts({"project": "false", "projset": True}) == {
+            "project": False, "projset": "rw"}
+
+    @pytest.mark.parametrize("mounts, message", [
+        ({"data": "rw"}, "unknown mount 'data'"),
+        ({"home": "write"}, "expected rw, ro, or false"),
+        (["home"], "must be a mapping"),
+    ])
+    def test_mounts_invalid(self, mounts, message):
+        with pytest.raises(ValueError, match=message):
+            ExperimentSpec.from_dict({"name": "e", "mounts": mounts})
+
+    def test_mount_entries(self):
+        # Unset: every default directory read-write, platform order.
+        assert mount_entries(None) == [(5, 1), (4, 1), (2, 1)]
+        assert mount_entries({"project": False, "projset": "ro"}) == [(5, 1), (2, 0)]
+        assert mount_entries({"home": False, "project": False, "projset": False}) == []
+        assert mount_entries_rest({"home": False, "project": False}) == [
+            {"directoryType": 2, "accessMode": 1}]
+
     def test_roundtrip(self):
         original = {
             "name": "exp", "image": "img:1", "image_region": "PRIVATE",
@@ -360,3 +390,39 @@ class TestCategoryPriority:
         validate_job(self._job(queue_category="idle"), None)
         validate_job(self._job(queue_category="public"), None)
         validate_job(self._job(queue_category="dedicated", priority="low"), None)
+
+
+class TestRemoteSpec:
+    def test_defaults_to_public(self):
+        from jrun.models import PUBLIC, RemoteSpec
+        spec = RemoteSpec.from_dict({"url": "https://svc:8443/"})
+        assert spec.url == "https://svc:8443"
+        assert spec.categories == (PUBLIC,)
+
+    def test_categories_normalized(self):
+        from jrun.models import IDLE, PUBLIC, RemoteSpec
+        spec = RemoteSpec.from_dict({"url": "http://svc", "categories": ["public", "idle"]})
+        assert spec.categories == (PUBLIC, IDLE)
+
+    @pytest.mark.parametrize("data, message", [
+        ({"url": "svc:8080"}, "http"),
+        ({}, "http"),
+        ("http://svc", "mapping"),
+        ({"url": "http://svc", "token": "x"}, "unknown field"),
+        ({"url": "http://svc", "categories": ["vip"]}, "queue_category"),
+    ])
+    def test_invalid(self, data, message):
+        from jrun.models import RemoteSpec
+        with pytest.raises(ValueError, match=message):
+            RemoteSpec.from_dict(data)
+
+    def test_routes_by_effective_category(self):
+        from jrun.models import RemoteSpec
+        remote = RemoteSpec.from_dict({"url": "http://svc"})
+        spec = ExperimentSpec(name="e", queue_name="pool", queue_category="public")
+        public = Job(name="a")
+        idle = Job(name="b", resource_config=ResourceConfig(queue_category="idle"))
+        local = Job(name="c", resource_config=ResourceConfig(queue_name="local"))
+        assert remote.routes(public, spec)          # experiment default: public
+        assert not remote.routes(idle, spec)        # job-level category wins
+        assert not remote.routes(local, spec)       # local runs never go remote

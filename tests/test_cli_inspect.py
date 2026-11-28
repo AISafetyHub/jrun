@@ -1,3 +1,4 @@
+import json
 from unittest.mock import MagicMock, patch
 
 from jrun.cli import cli
@@ -145,6 +146,68 @@ class TestQueues:
         assert "Public-Pool-X" in result.output
 
 
+def _waiting_cell(output, queue_name):
+    """Last column (WAITING) of the row naming ``queue_name``."""
+    row = next(line for line in output.splitlines() if queue_name in line)
+    return row.split()[-1]
+
+
+class TestQueuesWaiting:
+    @staticmethod
+    def _api(mock_api_cls, dedicated=(), shared=()):
+        from jrun.api import PlatformAPI as RealAPI
+        mock_api_cls.queue_free_resources = RealAPI.queue_free_resources
+        mock_api = MagicMock()
+        mock_api.list_queues.return_value = list(dedicated)
+        mock_api.list_shared_queues.side_effect = lambda **kw: [
+            {**q, "queueCategory": "QUEUE_CATEGORY_" + kw["queue_category"].upper()}
+            for q in shared]
+        mock_api.list_shared_queue_job_counts.return_value = []
+        mock_api.shared_queue_limits.return_value = {}
+        mock_api.shared_waiting_counts.return_value = {}
+        mock_api.queue_waiting_count.return_value = 0
+        mock_api_cls.return_value = mock_api
+        return mock_api
+
+    @patch("jrun.commands.inspect.PlatformAPI")
+    def test_fifo_dedicated_queue_shows_waiting_jobs(self, mock_api_cls, runner):
+        api = self._api(mock_api_cls, dedicated=[{**SAMPLE_QUEUE, "scheduleStrategy": 0}])
+        api.queue_waiting_count.return_value = 3
+        result = runner.invoke(cli, ["queues", "--category", "dedicated"])
+        assert result.exit_code == 0, result.output
+        assert "WAITING" in result.output
+        assert _waiting_cell(result.output, "jiuding_airs1_h100") == "3"
+        api.queue_waiting_count.assert_called_once_with("qid-1", proj_id="p1", projset_id="ps1")
+
+    @patch("jrun.commands.inspect.PlatformAPI")
+    def test_traverse_queue_is_not_counted(self, mock_api_cls, runner):
+        api = self._api(mock_api_cls, dedicated=[{**SAMPLE_QUEUE, "scheduleStrategy": 1}])
+        result = runner.invoke(cli, ["queues", "--category", "dedicated"])
+        assert _waiting_cell(result.output, "jiuding_airs1_h100") == "-"
+        api.queue_waiting_count.assert_not_called()
+
+    @patch("jrun.commands.inspect.PlatformAPI")
+    def test_shared_pool_waiting_is_priority_aware(self, mock_api_cls, runner):
+        pool = {"queueId": "s", "name": "Public-Pool-A100", "clusterDisplayName": "c",
+                "quota": {"acceleratorCount": 8}, "used": {"acceleratorCount": 3}}
+        api = self._api(mock_api_cls, shared=[pool])
+        api.shared_waiting_counts.return_value = {
+            ("QUEUE_CATEGORY_PUBLIC", "s"): 2, ("QUEUE_CATEGORY_IDLE", "s"): 5}
+        public = runner.invoke(cli, ["queues", "--category", "public"])
+        idle = runner.invoke(cli, ["queues", "--category", "idle"])
+        assert _waiting_cell(public.output, "Public-Pool-A100") == "2"
+        assert _waiting_cell(idle.output, "Public-Pool-A100") == "7"
+
+    @patch("jrun.commands.inspect.PlatformAPI")
+    def test_waiting_errors_show_dash(self, mock_api_cls, runner):
+        from jrun.errors import ApiError
+        api = self._api(mock_api_cls, dedicated=[{**SAMPLE_QUEUE, "scheduleStrategy": 2}])
+        api.queue_waiting_count.side_effect = ApiError("job/select", 403, "forbidden")
+        result = runner.invoke(cli, ["queues", "--category", "dedicated"])
+        assert result.exit_code == 0, result.output
+        assert _waiting_cell(result.output, "jiuding_airs1_h100") == "-"
+
+
 class TestGpuUsage:
     SAMPLE_ITEMS = [
         {"jobId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "ownerName": "dev1",
@@ -255,3 +318,44 @@ class TestGpuUsage:
         result = runner.invoke(cli, ["gpu-usage"])
         assert result.exit_code == 1
         assert "admin token" in result.output
+
+
+class TestQueuesJson:
+    @patch("jrun.commands.inspect.PlatformAPI")
+    def test_json_rows(self, mock_api_cls, runner, tmp_path, monkeypatch):
+        from jrun.api import PlatformAPI as RealAPI
+        mock_api_cls.queue_free_resources = RealAPI.queue_free_resources
+        monkeypatch.chdir(tmp_path)
+        mock_api = MagicMock()
+        mock_api.list_shared_queues.return_value = [{
+            "queueId": "shared-q", "name": "Public-Pool-H20",
+            "queueCategory": "QUEUE_CATEGORY_IDLE", "acceleratorModel": "H20",
+            "clusterId": "c", "zoneId": "z", "clusterDisplayName": "cluster",
+            "zoneDisplayName": "zone",
+            "quota": {"acceleratorCount": 8}, "used": {"acceleratorCount": 3},
+        }]
+        mock_api.list_shared_queue_job_counts.return_value = [{
+            "queue": {"queueId": "shared-q"}, "runningCount": 2}]
+        mock_api.shared_queue_limits.return_value = {"max_idle_jobs_per_projset": 5}
+        mock_api.shared_waiting_counts.return_value = {}
+        mock_api_cls.return_value = mock_api
+
+        result = runner.invoke(cli, ["queues", "--category", "idle", "--projset-id", "ps-1",
+                                     "--json"])
+
+        assert result.exit_code == 0, result.output
+        row = json.loads(result.output)["queues"][0]
+        assert row["category"] == "idle"
+        assert row["queue_name"] == "Public-Pool-H20"
+        assert row["queue_id"] == "shared-q"
+        assert row["resources"] == [{"model": "H20", "total": 8, "used": 3, "free": 5}]
+        assert (row["running"], row["limit"]) == (2, 5)
+        assert mock_api.list_shared_queues.call_args.kwargs["projset_id"] == "ps-1"
+
+    @patch("jrun.commands.inspect.PlatformAPI")
+    def test_json_empty(self, mock_api_cls, runner):
+        mock_api = MagicMock()
+        mock_api.list_queues.return_value = []
+        mock_api_cls.return_value = mock_api
+        result = runner.invoke(cli, ["queues", "--category", "dedicated", "--json"])
+        assert json.loads(result.output) == {"queues": []}

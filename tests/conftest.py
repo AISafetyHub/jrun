@@ -14,6 +14,14 @@ def _no_real_http(monkeypatch):
     monkeypatch.setattr(urllib.request.OpenerDirector, "open", blocked)
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_jrun_env(monkeypatch):
+    """Keep the developer's token/off-platform settings out of every test."""
+    for name in ("AIRS_TOKEN", "JRUN_AIRSCTL_GATEWAY", "JRUN_AIRSCTL_PROJ_ID",
+                 "JRUN_AIRSCTL_PROJSET_ID"):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def runner():
     return CliRunner()

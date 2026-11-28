@@ -1,10 +1,30 @@
 # 九鼎平台 REST API 参考
 
-本文档汇总 jrun 依赖的九鼎平台 REST API。jrun 中所有直接 HTTP 调用都封装在
-`src/jrun/api.py`(`PlatformAPI`)，本文档是该模块（以及未来新增接口调用）的
+本文档汇总 jrun 依赖的九鼎平台 REST API，是相关模块（以及未来新增接口调用）的
 权威参考。
 
-**维护约定**：平台接口变动时，先更新本文档，再改 `api.py` / 相关代码；反之，
+### 代码分层
+
+- `jrun/jiuding/` —— 九鼎平台的**原始接口层**，不含 jrun 业务逻辑：
+  - `jiuding/rest.py`（`JiudingRest`）：认证（AK/SK 换 Token、凭据来源）、HTTP
+    请求，以及**每个 REST 接口一个薄方法**（传入 body 和项目/项目集/集群/可用区
+    上下文，原样返回响应）：`exchange_token`、`get_userinfo`、
+    `projsets_select_joined`、`queue_select`、`job_select`、`shared_queue_list`、
+    `shared_queue_job_count`、`shared_queue_config`、`experiment_create`、
+    `experiment_delete`、`job_snapshots_select`；以及 `paging()` / `paginate()`。
+  - `jiuding/airsctl.py`（`Airsctl`）：每个 airsctl 子命令一个方法（见
+    `docs/airsctl.md`）。
+  - `jiuding/enums.py`：平台枚举值（任务状态码、调度策略、队列类别、镜像区域、
+    存储目录类型/访问模式）。
+- `jrun/api.py`（`PlatformAPI(JiudingRest)`）—— 基于原始接口的 jrun 逻辑：
+  projset 遍历、名称→ID 解析、共享队列名额、排队任务数、空卡解析、建实验 body。
+- `jrun/platform.py`（`PlatformClient(Airsctl)`）—— 基于 airsctl 的实验文档 /
+  config 工作集逻辑。
+
+新增平台接口时：原始调用加到 `jiuding/rest.py`，业务逻辑加到 `api.py`，并更新
+本文档（包括末尾的对照表）。
+
+**维护约定**：平台接口变动时，先更新本文档，再改 `jiuding/rest.py` / `api.py` / 相关代码；反之，
 代码里新增任何平台接口调用，也必须回填本文档。CLAUDE.md 将此列为强制规则。
 
 ## 通用说明
@@ -12,7 +32,7 @@
 ### Base URL
 
 - 统一入口：`https://platform-multi.baai.ac.cn`（jrun 代码使用的域名，
-  `api.py` 中的 `PLATFORM_API_BASE`，可用环境变量 `JRUN_API_BASE` 覆盖）
+  `jiuding/rest.py` 中的 `PLATFORM_API_BASE`，可用环境变量 `JRUN_API_BASE` 覆盖）
 - 各集群前端入口（如 `http://platform-dx6.baai.ac.cn` 大兴）只是域名不同，
   接口路径完全一致。本文档所有路径均省略 host。
 
@@ -69,7 +89,7 @@ Signature             = Hex(HMAC-SHA256(SK, StringToSign))
 ```
 
 - 时间戳格式：ISO 8601 UTC，如 `20260514T055649Z`，签名后 **5 分钟内有效**。
-- 实现参考：`api.py` 的 `compute_signature()`。
+- 实现参考：`jiuding/rest.py` 的 `compute_signature()`。
 
 ### 请求头
 
@@ -108,7 +128,8 @@ Signature             = Hex(HMAC-SHA256(SK, StringToSign))
 - **认证**：`AIRS-Token`
 
 jrun 用途：`create_experiment` 前取 `creatorId`（必填的 int64 proto 字段，
-服务端不会从 token 推导）。
+服务端不会从 token 推导）；`PlatformAPI.whoami()`（`jrun whoami`）归一化身份信息；
+远程提交服务（`docs/remote-service.md`）用**调用者自己的 token**调用本接口验证身份。
 
 响应（外层包 `code`/`data`）：
 
@@ -123,6 +144,12 @@ jrun 用途：`create_experiment` 前取 `creatorId`（必填的 int64 proto 字
   }
 }
 ```
+
+2026-11-27 实测（正常可用的账号）：`status` 为 `0`（上面示例中的 `1` 未必表示正常），
+另有 `identityType`（如 `"院内"`）、`disabledTime`（未停用时为 `"0"`）、
+`disabledOperatorId` 等字段。jrun 以 `disabledTime` 为空或 `"0"` 判定账号可用
+（`whoami()["active"]`），不依赖 `status` 的取值含义。无效 token 返回 HTTP 401
+`unauthenticated: invalid token: unable to identify user`。
 
 ---
 
@@ -175,6 +202,21 @@ Body：
   使用 `project_set_name`、`project_name`、`region_name`、`zone_name`、
   `queue_name` 进行名称链解析，平台 ID 只保留在内部提交 payload 中。
 - `status`：`QUEUE_STATUS_ACTIVE` 等。
+- `scheduleStrategy`：队列调度策略（`jiuding/enums.py` 的 `ScheduleStrategy`）：
+
+  | 值 | 名称 | 含义 |
+  |---|---|---|
+  | 0 | FIFO | 先进先出：配额检查失败时退出调度循环，后面的任务都不会启动 |
+  | 1 | Traverse | 遍历队列中所有任务，配额检查失败的任务被跳过 |
+  | 2 | Smart | 内部优先级（InternalJobPriority）高的任务用 FIFO，其余用 Traverse |
+  | 3 | Shared | 共享队列调度；调度器中尚未注册，运行时退回 FIFO |
+
+  2026-11-25 实测专属队列 0/1/2 都有；`shared-queue/list` 的行没有该字段。
+  因此 FIFO 队列可能显示有空卡，但前面已有排队任务（例如排队任务要 8 卡而只空
+  5 卡），新任务也不会启动。jrun 的 auto 选队列（`placement.py`）和 `jrun queues`
+  的 WAITING 列据此处理：除 Traverse 外都按 FIFO 对待（Smart 保守地按 FIFO，
+  缺失/未知同样按 FIFO）。
+- `jobInfos`：实测总是空数组，排队任务需要用 `job/select` 按队列查询（§5.1）。
 
 <details>
 <summary>完整响应示例</summary>
@@ -247,6 +289,13 @@ jrun 实现：按实验过滤用于 `jrun experiment jobs`（`experiment_jobs()`
 
 ### 5.1 按队列过滤（平台「队列详情」页）
 
+jrun 实现：`PlatformAPI.queue_waiting_count()`（auto 选队列、`jrun queues` 的
+WAITING 列）。`job_state` 传 `[0, 6]`（Pending、Scheduling，即
+`JobState.WAITING`），`pageSize` 为 1，只读 `paging.total`（缺失时退回
+`jobInfos` 的长度）。2026-11-25 实测：专属队列返回该队列的全部排队任务；对共享
+资源池只返回本项目集的任务，因此共享资源池改用 `shared-queue/job-count`
+（`allProjsets: true`，见 §5.3）。
+
 ```json
 {
   "paging": {"page": 1, "pageSize": 10, "sort": "", "order": ""},
@@ -283,8 +332,18 @@ jrun 实现：按实验过滤用于 `jrun experiment jobs`（`experiment_jobs()`
 
 - `id` / `experimentId` / `experimentName` / `configName` / `configId`
 - `status`：`Running` / `Pending` / `Approving` / `Cancelled` 等；`states` 为
-  状态流转历史（JSON 字符串，State 码：0=Pending, 1=Running, 4=Cancelled,
-  5=Starting, 6=Scheduling, 9=Approving）。`Approving` 是公共队列任务等待审批
+  状态流转历史（JSON 字符串）。State 码（`jiuding/enums.py` 的 `JobState`，
+  也用于请求中的 `job_state` 过滤）：
+
+  | 码 | 状态 | 码 | 状态 |
+  |---|---|---|---|
+  | 0 | Pending | 6 | Scheduling（已入队，等待资源） |
+  | 1 | Running | 7 | Stopped |
+  | 2 | Succeed | 8 | Migrating |
+  | 3 | Failed | 9 | Approving |
+  | 4 | Cancelled | 10 | Rejected |
+  | 5 | Starting | | |
+`Approving` 是公共队列任务等待审批
   （2026-11-24 实测，在审批中 stop 后变为 `Cancelled`）；`Pending` 是平台上等待
   调度的真实 job。两者 jrun 都视为活跃、可停止的状态。
 - `queueId` / `queueName` / `priority` / `roleInfos[]`（含资源请求明细）
@@ -412,8 +471,17 @@ Body（`projsetId` / `zoneId` 只在有值时发送）：
 `queueCategory` 只能是 `QUEUE_CATEGORY_PUBLIC` 或 `QUEUE_CATEGORY_IDLE`。
 
 响应：`items[]`（部分版本为 `sharedQueueJobCounts[]`），每行对应一个共享队列：
-`queue.queueId`（或 `queue.id`）标识队列，`runningCount`、`queueingCount`
-及审批计数为本项目集在该模式下的作业数。`jrun queues` 只读取 `queue.queueId`
+`queue.queueId`（或 `queue.id`）标识队列，`jobCount`、`runningCount`、
+`queueingCount`、`queueingHighCount`、`approvingCount` 为本项目集在该模式下的
+作业数；`allProjsets: true` 时统计所有项目集（2026-11-25 实测可用）。
+
+**排队任务数**（`PlatformAPI.shared_waiting_counts()`，auto 选队列和 `jrun queues`
+的 WAITING 列）：每种模式各调用一次 `allProjsets: true`，排队数 =
+max(`jobCount` − `runningCount` − `approvingCount`, `queueingCount`)。实测
+`queueingCount` 不包含处于 Scheduling 的闲时任务（本项目集 5 个 Scheduling 闲时
+任务时 idle 的 `queueingCount` 为 0、`jobCount` 为 5），公共模式下两种算法一致。
+共享资源池按 FIFO 处理，并按优先级区分（`api.shared_waiting_ahead()`）：公共任务
+（high）只排在等待中的公共任务之后，闲时任务（low）排在公共和闲时任务之后。`jrun queues` 只读取 `queue.queueId`
 和 `runningCount`；`PlatformAPI.shared_queue_budgets()`（auto 选队列和
 scheduler）把所有行的 `runningCount + queueingCount` 相加，作为该模式已占用的
 提交名额。
@@ -509,6 +577,25 @@ jrun 实现：`PlatformAPI.create_experiment()`。要点：
   后续 modify 所需的平台结构模板。
 - `resourceConfigList[0]` 中的 `queueId`/`queueName`/`clusterId`/`zoneId`/
   `acceleratorModel` 来自 `queue/select` 结果（`queue_location_info`）。
+- `storageInfo`：挂载到任务中的存储目录，由 YAML 的 `experiment.mounts` 生成
+  （`models.mount_entries_rest`）。REST 用 camelCase：
+  `{"directoryType": <类型>, "accessMode": <模式>}`；不挂载的目录直接不出现，全部
+  不挂载时发送 `[]`。不写 `mounts` 时发送平台默认的三项（都为 1）。
+
+  | `directoryType` | 目录 | `mounts` 键 |
+  |---|---|---|
+  | 5 | `/home/<用户>`（个人目录，airsctl 文档中带 `user_id`） | `home` |
+  | 4 | `/share/project`（项目共享目录） | `project` |
+  | 2 | `/share/projset`（项目集共享目录） | `projset` |
+
+  `accessMode`：1 = 读写（`rw`），0 = 只读（`ro`）。2026-11-25 在开发环境 pod 上
+  确认三个目录都以 LeoFS 读写挂载，5 = home 由 `user_id` 字段确认；4/2 与
+  project/projset 的对应、以及 0 = 只读，按平台写入顺序和开发环境接口示例
+  （type 2 accessMode 0）推断，待探测任务验证。
+- airsctl 的实验文档中同一字段为 snake_case `storage_info`：
+  `[{"directory_type": 5, "access_mode": 1, "user_id": <int>, "medium": 1}, ...]`。
+  jrun 在 `experiment modify` 时按 `mounts` 重写它（`PlatformClient._storage_info`），
+  并沿用已有同类型条目的 `user_id`/`medium` 等字段；不写 `mounts` 时不改动。
 - `experimentType` 传字符串 `"1"`。
 
 Body（jrun 实际发送的结构）：
@@ -748,24 +835,27 @@ jrun 写入的变量也会出现在任务环境中（实测）：config 的 `env
 
 ## 附：jrun 接口使用对照表
 
-| 接口 | jrun 模块/函数 | 用途 |
-|---|---|---|
-| `POST /users/token/exchange` | `api.py` `exchange_token` / `compute_signature` | AK/SK 换 Token |
-| `GET /users/token/userinfo` | `api.py` `get_userinfo` | 取 `creatorId`（建实验前） |
-| `POST /projsets/select-joined` | `api.py` `list_joined_projsets` / `resolve_project_context` | projset 上下文补全；`project_set_name`/`project_name` → ID |
-| `POST /queue/select` | `api.py` `list_queues` / `list_category_queues` / `find_queue` / `queue_free_resources`；`placement.py` `collect_candidates` | `jrun queues`、队列名→ID 解析、空闲配额、auto 选队列的专属候选 |
-| `POST /shared-queue/list` | `api.py` `list_shared_queues` / `list_category_queues`；`placement.py` `collect_candidates` | 公共/闲时队列与卡型、配额、集群/可用区查询、auto 选队列的共享候选 |
-| `POST /shared-queue/job-count` | `api.py` `list_shared_queue_job_counts` / `shared_queue_budgets` | 公共/闲时项目运行数和排队数；auto 选队列和 scheduler 的剩余提交名额 |
-| `POST /shared-queue/config` | `api.py` `shared_queue_limits` / `shared_queue_budgets` | 公共/闲时项目集上限；剩余提交名额 |
-| `POST /job/select` | `api.py` `experiment_jobs` / `experiment_jobs_all` | `jrun experiment jobs`（按实验过滤；按队列过滤未使用） |
-| `POST /workspaces/select` | 未使用 | — |
-| `POST /experiment` | `api.py` `create_experiment` | `jrun experiment create` / submit 自动建实验 |
-| `PUT /experiment/{id}` | 未使用（config 工作集走 `PlatformClient.modify_configs` + airsctl `experiment modify`） | 全量编辑实验 |
-| `POST /experiment/delete` | `api.py` `delete_experiment` | `jrun experiment delete`（归档语义） |
-| `POST /job-snapshots/select` | `api.py` `job_snapshots` / `job_snapshots_all` | `jrun gpu-usage` |
+| 接口 | 原始方法（`jiuding/rest.py`） | jrun 逻辑（`api.py` 等） | 用途 |
+|---|---|---|---|
+| `POST /users/token/exchange` | `exchange_token` / `compute_signature` | — | AK/SK 换 Token |
+| `GET /users/token/userinfo` | `get_userinfo` | `_current_user` / `whoami` | 取 `creatorId`（建/删实验前）；`jrun login` 校验；`jrun whoami`；远程服务以调用者 token 验证身份 |
+| `POST /projsets/select-joined` | `projsets_select_joined` | `list_joined_projsets` / `resolve_project_context` / `whoami` | projset 上下文补全；`project_set_name`/`project_name` → ID；远程服务检查调用者是否已加入项目集 |
+| `POST /queue/select` | `queue_select` | `list_queues` / `list_category_queues` / `find_queue` / `queue_free_resources`；`placement.py` `collect_candidates` | `jrun queues`、队列名→ID 解析、空闲配额、调度策略、auto 选队列的专属候选 |
+| `POST /shared-queue/list` | `shared_queue_list` | `list_shared_queues` / `list_category_queues`；`placement.py` `collect_candidates` | 公共/闲时资源池与卡型、配额、集群/可用区、auto 选队列的共享候选；远程服务以调用者 token（idle 视角）检查资源池可见性 |
+| `POST /shared-queue/job-count` | `shared_queue_job_count` | `list_shared_queue_job_counts` / `shared_queue_budgets` / `shared_waiting_counts` | 本项目集运行/排队数（RUN 列、剩余提交名额）；所有项目集的排队数（WAITING 列、auto 避开 FIFO 排队） |
+| `POST /shared-queue/config` | `shared_queue_config` | `shared_queue_limits` / `shared_queue_budgets` | 公共/闲时项目集上限；剩余提交名额 |
+| `POST /job/select` | `job_select` | `experiment_jobs` / `experiment_jobs_all`（按实验）；`queue_waiting_count`（按队列） | `jrun experiment jobs`；专属队列排队数（WAITING 列、auto 避开 FIFO 排队） |
+| `POST /workspaces/select` | 未使用 | — | — |
+| `POST /experiment` | `experiment_create` | `create_experiment` | `jrun experiment create` / submit 自动建实验（含 `storageInfo`） |
+| `PUT /experiment/{id}` | 未使用（config 工作集走 `PlatformClient.modify_configs` + airsctl `experiment modify`） | — | 全量编辑实验 |
+| `POST /experiment/delete` | `experiment_delete` | `delete_experiment` | `jrun experiment delete`（归档语义） |
+| `POST /job-snapshots/select` | `job_snapshots_select` | `job_snapshots` / `job_snapshots_all` | `jrun gpu-usage` |
 
-认证来源优先级（`api.py` `_resolve_token`）：`AIRS_AK`/`AIRS_SK` 环境变量 →
-`~/.jrun/auth.json`（`jrun login`）→ `/etc/accesskey/{user-ak,user-sk}`
-（base64，k8s secret 挂载）→ `/tmp/.airs/.token`（airsctl 缓存，直接用）。
+认证来源优先级（`jiuding/rest.py` `_resolve_token`）：`token=` 参数 / `AIRS_TOKEN`
+环境变量（现成 token，直接用；远程服务以此让 jrun 以调用者身份查询）→
+`AIRS_AK`/`AIRS_SK` 环境变量 → `~/.jrun/auth.json`（`jrun login`）→
+`/etc/accesskey/{user-ak,user-sk}`（base64，k8s secret 挂载）→ `/tmp/.airs/.token`
+（airsctl 缓存，直接用）。由 AK/SK 换得的 token 记录 `expiresIn`，在到期前 5 分钟重新
+换取（长期运行的进程，如远程服务）；直接使用的 token 不做过期处理。
 
 HTTP 实现注意：一律绕过环境代理（`ProxyHandler({})`），否则平台访问会失败。

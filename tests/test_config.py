@@ -571,3 +571,73 @@ job:
 """)
         with pytest.raises(ConfigError, match="unknown image_region"):
             ConfigLoader(cfg).get_experiment_spec()
+
+    def test_mounts_parsed(self, write_config):
+        cfg = write_config("""
+experiment:
+  name: my-exp
+  mounts:
+    project: false
+    projset: ro
+job:
+  name: my-job
+  command: echo hello
+""")
+        assert ConfigLoader(cfg).get_experiment_spec().mounts == {
+            "project": False, "projset": "ro"}
+
+    def test_storage_info_points_to_mounts(self, write_config):
+        from jrun.errors import ConfigError
+        cfg = write_config("""
+experiment:
+  name: my-exp
+  storage_info: []
+job:
+  name: my-job
+  command: echo hello
+""")
+        with pytest.raises(ConfigError, match="use mounts"):
+            ConfigLoader(cfg).get_experiment_spec()
+
+
+class TestRemoteBlock:
+    def test_absent(self, write_config):
+        assert ConfigLoader(write_config("job:\n  name: j\n  command: c\n")).get_remote() is None
+
+    def test_parsed_with_env_substitution(self, write_config, monkeypatch):
+        monkeypatch.setenv("JRUN_REMOTE_URL", "http://svc:8080")
+        loader = ConfigLoader(write_config(
+            "remote:\n  url: $JRUN_REMOTE_URL\njob:\n  name: j\n  command: c\n"))
+        assert loader.get_remote().url == "http://svc:8080"
+
+    def test_invalid_is_config_error(self, write_config):
+        loader = ConfigLoader(write_config(
+            "remote:\n  url: http://svc\n  secret: x\njob:\n  name: j\n  command: c\n"))
+        with pytest.raises(ConfigError, match="remote: unknown field"):
+            loader.get_remote()
+
+
+class TestSelectOnly:
+    CONFIG = """
+search:
+  job_template:
+    name: t_{x}
+    command: c
+  params:
+    - name: x
+      values: [1, 2, 3]
+"""
+
+    def test_keeps_named_jobs_in_grid_order(self, write_config):
+        loader = ConfigLoader(write_config(self.CONFIG))
+        jobs = loader.select(loader.jobs(), ["t_3", "t_1", "t_1"])
+        assert [j.name for j in jobs] == ["t_1", "t_3"]
+
+    def test_empty_selection_keeps_all(self, write_config):
+        loader = ConfigLoader(write_config(self.CONFIG))
+        assert len(loader.select(loader.jobs(), ())) == 3
+
+    def test_unknown_name_fails(self, write_config):
+        loader = ConfigLoader(write_config(self.CONFIG))
+        with pytest.raises(ConfigError, match="no job named t_9"):
+            loader.select(loader.jobs(), ["t_9"])

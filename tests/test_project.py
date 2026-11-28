@@ -238,3 +238,41 @@ class TestTrackerExperimentId:
         tracker = project.load_tracker()
         assert tracker["jobs"]["old-id"]["name"] == "pending"
         assert tracker["jobs"][ids[0]]["replace_job_id"] == "old-id"
+
+
+class TestRemoteTracking:
+    ROWS = [{"job_id": "r-1", "name": "a", "params": {"x": 1}, "status": "Submitted",
+             "experiment_id": "reid", "experiment_name": "u-exp"},
+            {"job_id": "queued-abc", "name": "b", "status": "Queued"}]
+
+    def test_record_search_entries_with_remote_url(self, project):
+        project.record_remote_jobs("s", "c.yaml", self.ROWS, "http://svc")
+        tracker = project.load_tracker()
+        assert tracker["searches"]["s"]["job_ids"] == ["r-1", "queued-abc"]
+        entry = tracker["jobs"]["r-1"]
+        assert entry["remote"] == "http://svc"
+        assert (entry["experiment_id"], entry["experiment_name"]) == ("reid", "u-exp")
+        assert entry["params"] == {"x": 1}
+        assert tracker["jobs"]["queued-abc"]["status"] == "Queued"
+
+    def test_keeps_local_jobs_of_the_same_search(self, project):
+        project.record_search("s", "c.yaml", [{"job_id": "loc-1", "name": "c"},
+                                              {"job_id": "loc-2", "name": "a"}])
+        project.record_remote_jobs("s", "c.yaml", self.ROWS[:1], "http://svc")
+        # local 'c' kept, same-name local 'a' leaves the search list
+        assert project.load_tracker()["searches"]["s"]["job_ids"] == ["loc-1", "r-1"]
+
+    def test_single_job_has_no_search(self, project):
+        project.record_remote_jobs(None, "c.yaml", self.ROWS[:1], "http://svc")
+        tracker = project.load_tracker()
+        assert tracker["searches"] == {}
+        assert tracker["jobs"]["r-1"]["search_name"] is None
+
+    def test_replace_job_id_keeps_position(self, project):
+        project.record_remote_jobs("s", "c.yaml", self.ROWS, "http://svc")
+        project.replace_job_id("queued-abc", "real-2", {"status": "Pending"})
+        tracker = project.load_tracker()
+        assert tracker["searches"]["s"]["job_ids"] == ["r-1", "real-2"]
+        assert tracker["jobs"]["real-2"]["status"] == "Pending"
+        assert tracker["jobs"]["real-2"]["remote"] == "http://svc"
+        assert "queued-abc" not in tracker["jobs"]

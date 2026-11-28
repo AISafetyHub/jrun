@@ -47,58 +47,7 @@ class TestParseJobStatus:
 
 class TestPlatformClientCommands:
     @patch("subprocess.run")
-    def test_non_utf8_airsctl_output_is_reported(self, mock_run):
-        mock_run.side_effect = [
-            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid"),
-            MagicMock(returncode=1, stdout=b"bad output \xff", stderr=b"error \xff"),
-        ]
-        with pytest.raises(PlatformError, match="error"):
-            PlatformClient()._run(["experiment", "modify", "-f", "config.json"])
-
-        assert mock_run.call_count == 2
-        assert mock_run.call_args_list[1].kwargs["text"] is False
-
-    @patch("subprocess.run")
-    def test_experiment_list_with_id(self, mock_run):
-        mock_run.return_value = MagicMock(stdout='{"data": []}', returncode=0)
-        client = PlatformClient()
-        client.experiment_list(exp_id="eid-1")
-        mock_run.assert_called_once_with(
-            ["airsctl", "experiment", "list", "-e", "eid-1"],
-            capture_output=True, text=True,
-        )
-
-    @patch("subprocess.run")
-    def test_experiment_list_with_name(self, mock_run):
-        mock_run.return_value = MagicMock(stdout="", returncode=0)
-        client = PlatformClient()
-        client.experiment_list(exp_name="my-exp")
-        mock_run.assert_called_once_with(
-            ["airsctl", "experiment", "list", "-N", "my-exp"],
-            capture_output=True, text=True,
-        )
-
-    @patch("subprocess.run")
-    def test_job_stop(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0)
-        client = PlatformClient()
-        client.job_stop("job-id-123")
-        mock_run.assert_called_once_with(
-            ["airsctl", "job", "stop", "-j", "job-id-123"],
-            capture_output=True, text=True,
-        )
-
-    @patch("subprocess.run")
-    def test_job_run_with_exp_and_config(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="")
-        PlatformClient().job_run("eid", "cfg")
-        mock_run.assert_called_once_with(
-            ["airsctl", "job", "run", "-e", "eid", "-n", "cfg"],
-            capture_output=True, text=True,
-        )
-
-    @patch("subprocess.run")
-    def test_job_run_shared_queue_options(self, mock_run):
+    def test_job_run_maps_run_options_to_flags(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0, stdout="")
         PlatformClient().job_run(
             "eid", "cfg",
@@ -372,6 +321,55 @@ class TestBuildJobConfig:
         document = _modify(Job(name="j"), spec)
         assert document["train_frame"] == "TensorFlow"
         assert document["hetero_type"] == 2
+
+
+class TestMounts:
+    """experiment.mounts -> snake_case storage_info in the modify document."""
+
+    STORAGE = [
+        {"directory_type": 5, "access_mode": 1, "user_id": 3198, "medium": 1},
+        {"directory_type": 4, "access_mode": 1, "medium": 1},
+        {"directory_type": 2, "access_mode": 1, "medium": 1},
+    ]
+
+    def _experiment(self, storage=None):
+        experiment = _template_experiment()
+        experiment["creator_id"] = 4242
+        if storage is not None:
+            experiment["storage_info"] = storage
+        return experiment
+
+    def test_unset_mounts_leave_document_untouched(self):
+        document = _modify(Job(name="j"), ExperimentSpec(name="e"),
+                           experiment=self._experiment(self.STORAGE))
+        assert document["storage_info"] == self.STORAGE
+
+    def test_drop_and_read_only_keep_platform_fields(self):
+        spec = ExperimentSpec.from_dict({"name": "e", "mounts": {"project": False,
+                                                                 "projset": "ro"}})
+        document = _modify(Job(name="j"), spec, experiment=self._experiment(self.STORAGE))
+        assert document["storage_info"] == [
+            {"directory_type": 5, "access_mode": 1, "user_id": 3198, "medium": 1},
+            {"directory_type": 2, "access_mode": 0, "medium": 1},
+        ]
+
+    def test_remount_adds_entries_snake_case(self):
+        # Experiment created with nothing mounted; mounting again needs fresh
+        # entries (home gets the creator as user_id).
+        spec = ExperimentSpec.from_dict({"name": "e", "mounts": {"home": "rw"}})
+        document = _modify(Job(name="j"), spec, experiment=self._experiment([]))
+        assert document["storage_info"] == [
+            {"directory_type": 5, "medium": 1, "user_id": 4242, "access_mode": 1},
+            {"directory_type": 4, "medium": 1, "access_mode": 1},
+            {"directory_type": 2, "medium": 1, "access_mode": 1},
+        ]
+        assert all("directoryType" not in e for e in document["storage_info"])
+
+    def test_all_unmounted_writes_empty_list(self):
+        spec = ExperimentSpec.from_dict({"name": "e", "mounts": {
+            "home": False, "project": False, "projset": False}})
+        document = _modify(Job(name="j"), spec, experiment=self._experiment(self.STORAGE))
+        assert document["storage_info"] == []
 
 
 class TestModifyConfigs:
@@ -687,3 +685,17 @@ class TestFindExperiment:
         client.find_experiment("my-exp")
         client.get_experiment("eid-1")
         assert mock_run.call_count == 1
+
+
+class TestOffPlatformContext:
+    @patch("subprocess.run")
+    def test_set_context_clears_experiment_cache(self, mock_run):
+        exp_data = {"experiment_id": "eid", "advance_config_infos": []}
+        mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(exp_data), stderr="")
+        client = PlatformClient(gateway_url="http://gw")
+        client.get_experiment("eid")
+        client.set_context("p2", "ps2")  # experiment lookups are project-scoped
+        client.get_experiment("eid")
+        assert mock_run.call_count == 2
+        assert mock_run.call_args.args[0][-4:] == ["-P", "ps2", "-p", "p2"]
+        assert client.context == ("p2", "ps2")

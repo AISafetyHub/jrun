@@ -1,0 +1,49 @@
+description: Send public-pool jobs through a jrun remote-submission service
+
+# For accounts that may submit to dedicated and idle queues but not to the
+# public pool: a jrun service (server/, run with a key that may use public)
+# submits the public jobs on your behalf. It verifies who you are with your
+# own credentials and checks that you can see the target project set and
+# pool (as idle). Jobs that do not land on public run locally as usual.
+#
+#   jrun submit examples/remote-public.yaml --dry-run   # shows Route: per job
+#   jrun submit examples/remote-public.yaml
+#   jrun job status / stop / remove                    # remote jobs go through the service
+#
+# On the service the experiment is named "<your alias>-jrun_example" and
+# mounts.home is off (it would be the service account's home).
+experiment:
+  name: jrun_example
+  # Jobs sent to the service need a project set (the service checks it).
+  project_set_name: baai-safety
+  project_name: baai-safety_research
+  mounts:
+    project: rw
+    projset: rw
+
+remote:
+  url: $JRUN_REMOTE_URL          # e.g. export JRUN_REMOTE_URL=https://jrun-svc.example.com
+  categories: [public]           # default: only public jobs go remote
+
+search:
+  name: remote_eval
+  job_template:
+    name: remote_eval_{data}
+    image: harbor.baai.ac.cn/llm-safety-center/enviroments:agents-v1.0.0
+    commands:
+      - echo "dataset={data} on $$JRUN_QUEUE_NAME"
+    resource_config:
+      queue_name: auto
+      # Prefer the public pool (through the service), else idle (locally).
+      queue_category: [public, idle]
+      accelerator_model: NVIDIA_V100-PCIE-32GB
+      accelerator_count: 1
+      cpu_cores: 8
+      mem_gib: 64
+    run_options:
+      duration_hours: 12
+      queue_priority_mode: normal
+      usage_desc: remote submission example
+  params:
+    - name: data
+      values: [arc, gsm8k]

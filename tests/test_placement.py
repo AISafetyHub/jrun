@@ -2,7 +2,7 @@
 
 import pytest
 
-from jrun.errors import ConfigError
+from jrun.errors import ApiError, ConfigError
 from jrun.models import (ExperimentSpec, Job, ResourceConfig, RoleConfig,
                          job_target)
 from jrun.placement import QUEUE, START, WAIT, place_auto_jobs
@@ -11,11 +11,12 @@ A100 = "NVIDIA_A100-SXM4-40GB"
 V100 = "NVIDIA_V100-PCIE-32GB"
 
 
-def dedicated_row(name, model, total, used, qid=None, region="北京-大兴", zone="可用区A"):
-    """queue/select row (usedQuota form)."""
+def dedicated_row(name, model, total, used, qid=None, region="北京-大兴", zone="可用区A",
+                  strategy=0):
+    """queue/select row (usedQuota form); strategy 0 = FIFO, 1 = Traverse, 2 = Smart."""
     return {
         "id": qid or f"id-{name}", "name": name, "projsetName": "ps", "projName": "p",
-        "projId": "p1", "projsetId": "ps1",
+        "projId": "p1", "projsetId": "ps1", "scheduleStrategy": strategy,
         "usedQuota": {"computing": {model: {"total": {"high": total},
                                             "used": {"high": used}}}},
         "quotaInfoList": [{"clusterDisplayName": region,
@@ -33,13 +34,19 @@ def shared_row(name, model, total, used, qid=None, region="北京-大兴", zone=
 
 
 class FakeAPI:
-    def __init__(self, dedicated=(), shared=(), budgets=None):
+    def __init__(self, dedicated=(), shared=(), budgets=None, waiting=None,
+                 shared_waiting=None, waiting_error=False):
         self.dedicated = list(dedicated)
         self.shared = list(shared)
         self.budgets = budgets if budgets is not None else {
             "QUEUE_CATEGORY_PUBLIC": 4, "QUEUE_CATEGORY_IDLE": 5}
+        self.waiting = waiting or {}                # queue_id -> waiting jobs
+        self.shared_waiting = shared_waiting or {}  # (category, queue_id) -> waiting
+        self.waiting_error = waiting_error
         self.list_calls = []
         self.budget_calls = 0
+        self.waiting_calls = []
+        self.shared_waiting_calls = 0
 
     def resolve_project_context(self, project_set_name=None, project_name=None):
         return ("p1", "ps1") if project_set_name else (None, None)
@@ -51,6 +58,18 @@ class FakeAPI:
     def shared_queue_budgets(self, proj_id=None, projset_id=None):
         self.budget_calls += 1
         return dict(self.budgets)
+
+    def queue_waiting_count(self, queue_id, proj_id=None, projset_id=None):
+        self.waiting_calls.append(queue_id)
+        if self.waiting_error:
+            raise ApiError("job/select", 403, "forbidden")
+        return self.waiting.get(queue_id, 0)
+
+    def shared_waiting_counts(self, proj_id=None, projset_id=None):
+        self.shared_waiting_calls += 1
+        if self.waiting_error:
+            raise ApiError("job-count", 500, "boom")
+        return dict(self.shared_waiting)
 
 
 def auto_job(name, models=A100, counts=1, category="public", roles=None, **rc):
@@ -202,3 +221,88 @@ class TestApply:
         place(api, [job], spec)
         assert job_target(job, spec).queue_name == "S"
         assert job_target(job, spec).category == "QUEUE_CATEGORY_PUBLIC"
+
+
+PUB, IDL = "QUEUE_CATEGORY_PUBLIC", "QUEUE_CATEGORY_IDLE"
+
+
+class TestFifo:
+    """Queues with jobs already waiting do not start new jobs (FIFO)."""
+
+    def test_fifo_queue_with_waiting_jobs_is_skipped_for_start(self):
+        # "busy" shows the most free cards but has a job waiting ahead.
+        api = FakeAPI(dedicated=[dedicated_row("busy", A100, 56, 51),
+                                 dedicated_row("quiet", A100, 8, 4)],
+                      waiting={"id-busy": 1})
+        _, _, by_name = place(api, [auto_job("j", A100, 4, category="dedicated")])
+        assert by_name["j"].candidate.queue_name == "quiet"
+        assert by_name["j"].status == START
+
+    def test_traverse_queue_still_starts(self):
+        api = FakeAPI(dedicated=[dedicated_row("trav", A100, 8, 0, strategy=1)],
+                      waiting={"id-trav": 3})
+        _, _, by_name = place(api, [auto_job("j", A100, 4, category="dedicated")])
+        assert by_name["j"].status == START
+        assert api.waiting_calls == []  # Traverse never needs the count
+
+    def test_smart_counts_as_fifo(self):
+        api = FakeAPI(dedicated=[dedicated_row("smart", A100, 8, 0, strategy=2)],
+                      waiting={"id-smart": 2})
+        _, _, by_name = place(api, [auto_job("j", A100, 4, category="dedicated")])
+        assert by_name["j"].status == QUEUE
+        assert by_name["j"].waiting == 2
+
+    def test_blocked_dedicated_queue_with_fewest_waiting_is_used_for_queue(self):
+        api = FakeAPI(dedicated=[dedicated_row("long", A100, 8, 0),
+                                 dedicated_row("short", A100, 8, 6)],
+                      waiting={"id-long": 5, "id-short": 1})
+        _, _, by_name = place(api, [auto_job("j", A100, 4, category="dedicated")])
+        assert by_name["j"].candidate.queue_name == "short"
+        assert by_name["j"].status == QUEUE
+
+    def test_shared_pool_with_waiting_public_jobs_is_skipped(self):
+        api = FakeAPI(shared=[shared_row("busy", A100, 272, 248),
+                              shared_row("quiet", A100, 16, 8)],
+                      shared_waiting={(PUB, "id-busy"): 7})
+        _, _, by_name = place(api, [auto_job("j", A100, 8)])
+        assert by_name["j"].candidate.queue_name == "quiet"
+        assert by_name["j"].status == START
+
+    def test_public_not_blocked_by_waiting_idle_jobs(self):
+        api = FakeAPI(shared=[shared_row("S", A100, 16, 0)],
+                      shared_waiting={(IDL, "id-S"): 9})
+        _, _, by_name = place(api, [auto_job("j", A100, 8, category="public")])
+        assert by_name["j"].status == START
+
+    def test_idle_blocked_by_waiting_public_jobs(self):
+        api = FakeAPI(shared=[shared_row("S", A100, 16, 0)],
+                      shared_waiting={(PUB, "id-S"): 1})
+        _, _, by_name = place(api, [auto_job("j", A100, 8, category="idle")])
+        assert by_name["j"].status == QUEUE
+        assert by_name["j"].waiting == 1
+
+    def test_idle_blocked_by_waiting_idle_jobs(self):
+        api = FakeAPI(shared=[shared_row("S", A100, 16, 0)],
+                      shared_waiting={(IDL, "id-S"): 2})
+        _, _, by_name = place(api, [auto_job("j", A100, 8, category="idle")])
+        assert by_name["j"].status == QUEUE
+
+    def test_waiting_read_failure_falls_back_to_free_cards(self):
+        api = FakeAPI(dedicated=[dedicated_row("D", A100, 8, 0)],
+                      shared=[shared_row("S", A100, 8, 0)], waiting_error=True)
+        jobs = [auto_job("d", A100, 4, category="dedicated"),
+                auto_job("s", A100, 4, category="public")]
+        _, _, by_name = place(api, jobs)
+        assert by_name["d"].status == START and by_name["d"].waiting == 0
+        assert by_name["s"].status == START
+
+    def test_waiting_read_once_per_queue_and_projset(self):
+        api = FakeAPI(dedicated=[dedicated_row("D", A100, 64, 0),
+                                 dedicated_row("other-model", V100, 64, 0)],
+                      shared=[shared_row("S", A100, 64, 0)])
+        jobs = [auto_job(f"j{i}", A100, 1, category=["dedicated", "public", "idle"])
+                for i in range(4)]
+        place(api, jobs)
+        # Only the queue offering a wanted model is counted, once.
+        assert api.waiting_calls == ["id-D"]
+        assert api.shared_waiting_calls == 1
